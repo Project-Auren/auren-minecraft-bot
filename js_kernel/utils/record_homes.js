@@ -1,0 +1,130 @@
+'use strict';
+// record_homes — the one place that answers where a run's traces and records live.
+//
+// The kernel holds what a bot needs in order to run. Data the fleet reads live —
+// `corporate_headquarters*.json` — stays in the kernel; data that exists only for a person or a lens to
+// reconstruct a run afterwards — `watcher_*.jsonl` — lives outside it, in `fleet_logs/` (Law 6, Law 7 — a
+// location is a claim about what a thing is for).
+//
+// Traces join `fleet_logs/`, which already holds every other record of a run and is gitignored whole
+// (Law 16 — one answer to "where did the run go").
+//
+// The path lives in this module so every reader and writer agrees on one answer (Law 16 — same shape as
+// `node_module_homes`).
+//
+// This module is load-bearing for operation even though what it points traces at is not: `watcher.js`
+// cannot write a line without this answer, and every fragment imports the watcher.
+
+const fs = require('fs');
+const path = require('path');
+
+const BOT_DIR = path.resolve(__dirname, '..', '..');
+
+// Every file under `fleet_logs/` belongs to exactly one WORLD, from its rollback start on: each run of
+// that world is a segment of the same files, in order.
+//
+// AUREN_RECORDS_DIR points the room at another fleet's folder, for READING its run (trace_monitor --records
+// sets it). No fleet process sets it; a sweep refuses while it is set.
+const RECORDS_DIR = process.env.AUREN_RECORDS_DIR ? path.resolve(process.env.AUREN_RECORDS_DIR) : path.join(BOT_DIR, 'fleet_logs');
+
+// The records room. Every run trace, whatever unit wrote it — bots, the foreman, the cameras.
+const TRACE_DIR = path.join(RECORDS_DIR, 'traces');
+
+// Creates the trace directory on demand. Recursive so the parent is made too; idempotent, so any caller
+// may simply call it.
+function ensureTraceDir() {
+  fs.mkdirSync(TRACE_DIR, { recursive: true });
+  return TRACE_DIR;
+}
+
+// traceFile(unit) → the absolute path this unit's story is written to and read from.
+// An unnamed unit gets the bare name, which is what a standalone process (a tool, a bench) writes.
+function traceFile(unit) {
+  return path.join(TRACE_DIR, unit ? `watcher_${unit}.jsonl` : 'watcher.jsonl');
+}
+
+// The deep per-fragment trace artifact, kept beside the story it belongs to but never mixed into it
+// (Law 5 — the story is one file).
+function deepTraceFile(unit) {
+  return path.join(TRACE_DIR, unit ? `watcher_${unit}_trace.json` : 'watcher_trace.json');
+}
+
+// consoleLogFile(unit) → the file this unit's visible console window is tailing (Law 16, shared by the
+// foreman and the bot itself).
+//
+// The foreman pipes a bot's stdout into this file and opens a window on it. A bot appends here directly
+// only when the foreman is gone and the pipe carrying its stdout goes nowhere — the window is still open;
+// only its supplier died.
+//
+// Not the trace: the trace is the run's record and is read by the lenses; this is what is on a screen. A
+// body that appends here is talking to a person, not filing.
+function consoleLogFile(unit) {
+  return path.join(RECORDS_DIR, `console_${String(unit).replace(/[^A-Za-z0-9_-]/g, '_')}.log`);
+}
+
+// Empties fleet_logs/ whole. Called by a ROLLBACK start and by nothing else (start_auren.js; bench_world.js
+// when a bench asks for a rollback): the world goes back to its clean copy and so does what was written
+// about it. A continue start adds to every file here. Returns what it removed, not just a count, so a
+// caller can verify against the room afterwards (Law 25).
+// A HOLD KEEPS THESE RECORDS FOR INSPECTION: while its file lies in the room, no start runs on this world and no
+// sweep empties it, whoever asks.
+function architectHold() {
+  const file = path.join(RECORDS_DIR, 'architect_hold.json');
+  if (!fs.existsSync(file)) return null;
+  const read = require('./external_library_guard').guardExternalSync('record_homes', 'reading the hold', () => JSON.parse(fs.readFileSync(file, 'utf8')));
+  return read.ok ? read.value : { session: 'unreadable hold file', reason: read.reason };
+}
+
+// THE SEAT LOCK KEEPS THE SEAT FOR ONE SESSION'S COPY while that session runs: while its file lies in the room, a
+// start or sweep from any other copy is refused (start_auren, sweepRecords); the locking copy's own starts run. `copy` is
+// the folder holding the Auren_Bot that took it. The session machinery writes it at the session's start and lifts it
+// once the session is gone (Sessions/session_branch.js).
+const SEAT_LOCK = 'seat_lock.json';
+function seatLock() {
+  const file = path.join(RECORDS_DIR, SEAT_LOCK);
+  if (!fs.existsSync(file)) return null;
+  const read = require('./external_library_guard').guardExternalSync('record_homes', 'reading the seat lock', () => JSON.parse(fs.readFileSync(file, 'utf8')));
+  return read.ok ? read.value : { session: 'unreadable seat lock file', reason: read.reason, copy: null };
+}
+// Is this Auren_Bot the one the seat lock was taken for?
+function holdsSeat(lock) {
+  return !!lock && typeof lock.copy === 'string'
+    && path.resolve(lock.copy, 'Auren_Bot').toLowerCase() === path.resolve(BOT_DIR).toLowerCase();
+}
+
+// CLEARING IS AUTHORIZED PER SEAT BY THE ARCHITECT: a rollback start empties this room and puts the world back, and
+// it runs only where the room's clearing file says he allowed it. A room with no such file belongs to a bot outside
+// the session machinery (a downloaded copy, one server), and is its owner's to clear.
+const SEAT_CLEAR = 'seat_clear.json';
+// clearAuthorized() → { authorized, why }
+function clearAuthorized() {
+  const file = path.join(RECORDS_DIR, SEAT_CLEAR);
+  if (!fs.existsSync(file)) return { authorized: true, why: 'no clearing file: this records room is its owner\'s to clear' };
+  const read = require('./external_library_guard').guardExternalSync('record_homes', 'reading the clearing file', () => JSON.parse(fs.readFileSync(file, 'utf8')));
+  if (!read.ok) return { authorized: false, why: `the clearing file could not be read (${read.reason})` };
+  return read.value && read.value.authorized === true
+    ? { authorized: true, why: `the Architect authorized clearing seat ${read.value.seat} (${read.value.at}: "${read.value.word}")` }
+    : { authorized: false, why: `the Architect has not authorized clearing seat ${(read.value && read.value.seat) || RECORDS_DIR}` };
+}
+// The files a sweep keeps: they describe the seat, not the world's last run.
+const SEAT_FILES = new Set([SEAT_LOCK, SEAT_CLEAR]);
+
+function sweepRecords() {
+  if (process.env.AUREN_RECORDS_DIR) {
+    throw new Error(`[record_homes] CODING VIOLATION: sweepRecords with AUREN_RECORDS_DIR set (${RECORDS_DIR}). That variable is for reading another fleet's run; a fleet sweeps only its own.`);
+  }
+  const hold = architectHold();
+  if (hold) throw new Error(`[record_homes] ARCHITECT HOLD on ${RECORDS_DIR} (${hold.session}: ${hold.reason}). Nothing was swept; only his release lifts it.`);
+  const lock = seatLock();
+  if (lock && !holdsSeat(lock)) throw new Error(`[record_homes] SEAT LOCK on ${RECORDS_DIR} (${lock.session} since ${lock.at}). Nothing was swept; the seat is that session's while it runs.`);
+  const clear = clearAuthorized();
+  if (!clear.authorized) throw new Error(`[record_homes] CLEARING NOT AUTHORIZED on ${RECORDS_DIR}: ${clear.why}. Nothing was swept.`);
+  if (!fs.existsSync(RECORDS_DIR)) return { swept: false, entries: [], dir: RECORDS_DIR };
+  const entries = fs.readdirSync(RECORDS_DIR).filter((name) => !SEAT_FILES.has(name));
+  for (const name of entries) fs.rmSync(path.join(RECORDS_DIR, name), { recursive: true, force: true });
+  return { swept: true, entries, dir: RECORDS_DIR };
+}
+
+module.exports = {
+  TRACE_DIR, RECORDS_DIR, ensureTraceDir, traceFile, deepTraceFile, consoleLogFile, sweepRecords, architectHold, seatLock, holdsSeat, clearAuthorized, BOT_DIR,
+};

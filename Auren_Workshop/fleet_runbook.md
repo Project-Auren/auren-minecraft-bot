@@ -1,0 +1,1236 @@
+# Fleet Runbook — operating, testing, and inspecting the live Auren fleet
+
+> Operative procedure. It answers *"cold-start, how do I run the system and see what it did?"*
+> Read on demand; CLAUDE.md points here.
+>
+> **Procedure lives here. Reasoning and current state live in
+> `Documentation/records/architect_worklog.md`** (Law 29). Every command the
+> Architect copies to a terminal is in `Auren_Workshop/COMMANDS.txt` (everything that ships) and
+> `Architect_Commands.txt` at the repo root (the layer above, which does not ship).
+
+---
+
+## 1. What the fleet is
+
+A run is a set of real, detached, windowless OS processes:
+
+- **Minecraft server** (`java … server.jar`) on port 25565.
+- **Foreman** (`foreman/foreman_hub.js`) on port 3001 — the one coordinator. Holds the planning
+  token, merges every bot's trace into one stream, and carries every operator verb (Law 16).
+- **One bot process per roster entry** (`master_core.js`, `BOT_ID=AurenBot|TessaBot|IrisBot|…`). The
+  roster is `BOT_SENIORITY` in `Thinking_fragments/architect_config.js`; `node fleet_control.js roster`
+  prints it. Adding a bot is one edit there — launcher, cameras and peer-order follow. A run brings up
+  the whole roster; `-Count N` runs the first N.
+- **Live tracer** (`trace_monitor.js --watch --stream=dispatcher`) — read-only, launched beside the
+  fleet, streaming every task-pick to `fleet_logs/trace.log`. The sequence of picks is the fleet's status.
+
+Processes are spawned `detached` with stdio redirected to files, then `unref()`'d, so **nothing opens a
+console.** Find them in Task Manager or through `status`. Each process's output mirrors to
+`Auren_Bot/fleet_logs/<name>.log`.
+
+**Every `up` starts a clean run:** it clears `fleet_logs/traces/watcher_*.jsonl`, truncates
+`fleet_logs/*.log`, and releases the arena tapes.
+
+`fleet_control.js` is the single implementation of launch + command + teardown.
+`node start_auren.js` is the one way a RUN is started (§3). The run is the foreman's, whole: it starts,
+restores and stops a local world itself and carries out the run from `foreman_config.js` (2026-09-18).
+
+---
+
+## 2. Machine differences — the toolchain resolves itself; server config does not
+
+Long computations share `js_kernel/utils/execution_yield`: callers await a safe boundary between
+complete work units. Each process adapts its slice to scheduling delay, up to 50 ms, and yields a
+macrotask without a fixed sleep. Claims and immediate safety checks remain indivisible. Runtime HQ,
+player memory, and item-book snapshots write asynchronously in order; shutdown awaits their drains.
+The local Java server starts with a 512 MB heap and grows with demand up to 4 GB. Capacity runs use
+`--count 2` or `--count 4` and keep desktop applications open while the machine-load
+sampler records CPU, memory, paging, and disk response. Yielding helps the Node event loop stay
+responsive; server ticks, garbage collection, and operating-system memory pressure remain measured
+limits of each machine.
+
+`memoryWorkspace: 'adaptive'` gives planning and A* route computation the same gate, and the machine
+decides how many bodies are inside it together. One body plans at a time, always. A further body enters
+while the free RAM left after the allowances already granted still covers a full allowance for it, so a
+machine with room runs every route search side by side and a machine without it holds one body inside,
+planner or searcher. The measurement is taken at every request, so the same fleet narrows when another
+program takes the memory and widens when it is given back.
+Each holder gets a temporary memory allowance from current available RAM, after a system headroom
+margin, and a route search is held to it by what its own collections hold (entries counted, never
+whole-process heap growth, which on a filmed run cut every search at 128 nodes; Worklog §615); bounded plan-derived target caches shrink under pressure. Search
+collections clear on completion and combat handover. A memory-limited route is explicitly incomplete.
+The existing 30-second gate clock remains unchanged. A free gate grants immediately with no added
+sleep. The allowance grows with installed RAM and free JS heap capacity, with a 4 MB minimum work
+allowance; pressure can shrink it at search checkpoints. `--pathfinding` separates queue waiting
+from active search elapsed time and counts memory-limited searches. This prototype covers these owned workspaces;
+Minecraft, protocol libraries and other execution scans retain their own allocations. It reserves
+fleet ownership rather than physical RAM. Set `AUREN_MEMORY_WORKSPACE=off` before startup to compare
+with the previous route concurrency and cache behavior. `--gate` reports planning/execution grants
+and allowance ranges, `most_inside_at_once` and `two_planning_entries_open_at_once`; the live foreman
+door reports the current holders and queue under `workspace`.
+
+**Every lookup tries the ordinary install first, and only then one exact file above the bot**
+(2026-09-11: *"if run then check stranger way, if fail then architect way"*):
+
+| what | first | only if that fails |
+|---|---|---|
+| node | `node` on `PATH`, at least `engines.node` in `package.json` | the exact paths in `../Architect_workstation/workstation.json` |
+| npm | the npm inside whichever node was picked | — |
+| java | `java` on `PATH`, Java 25 or newer (26.1 refuses anything older — its own manifest says 25) | the same file's `java` list |
+| the Minecraft server folder | `AUREN_SERVER_DIR` — a folder holding `server.properties` | the same file's `server` list |
+| node_modules | `Auren_Bot/node_modules` | the same file's `node_modules` list |
+
+On a downloaded copy the second column does not exist, so a machine with Node and Java installed the
+ordinary way needs nothing else, and a local server is one environment variable. The file above the bot is
+opened by its exact name; nothing above the bot is ever searched.
+
+**Resolve node through these, every time.** A bare `node`/`npm` in a script works on one machine and not
+the next:
+
+```
+. .\Auren_Workshop\scripts\_node.ps1 ; Get-AurenNode      # -> node.exe for THIS machine
+.\Auren_Workshop\scripts\npm.ps1 <args>                   # npm, resolved; prints which one it picked
+.\Auren_Workshop\scripts\npm.ps1 install                  # from Auren_Bot\ : the bot's declared packages
+```
+
+Node is resolved once, by `scripts/_node.ps1`; everything JS starts after that runs on `process.execPath`.
+Java and the server folder are `js_kernel/utils/workstation.js` — from PowerShell,
+`& (Get-AurenNode) js_kernel\utils\workstation.js java|server` prints the answer or the refusal. The
+module homes go on `NODE_PATH` through `js_kernel/utils/node_module_homes`. The `@`-aliases (`@kernel`,
+`@perception`, …) come from `Auren_Bot/package.json` `_moduleAliases`, registered against `Auren_Bot/`
+explicitly.
+
+**On a box with no node on PATH, `npm install` in `Auren_Bot/` exits 1** — `ffmpeg-static`'s postinstall
+shells out to a bare `node`. Prepend the resolved node for that one invocation:
+
+```
+. .\Auren_Workshop\scripts\_node.ps1 ; $n = Get-AurenNode ; $env:PATH = (Split-Path $n) + ';' + $env:PATH
+.\Auren_Workshop\scripts\npm.ps1 install
+```
+
+The resolver RUNS each candidate rather than testing for the file: a distribution's `npm.cmd` can exist
+as a stub after `npm install` pruned `node_modules/npm` as extraneous. Its refusal names the repair.
+
+**Scripts, documents and instructions use the resolver even where a bare `node` happens to work**: PATH
+is per-machine state git does not carry, so a `node` line works on one machine and fails on the next.
+
+### 2a-pre. The dev worlds run PAPER (from 2026-11-23); vanilla stays the way back
+
+**RULING 2026-11-23, the Architect** (*"lets switch to paper for everything"*), after the parity check and fix
+below: every seat on this machine runs Paper 26.1.2 (`server-paper-26.1.2-b74.jar` copied to `server.jar`) with
+the `SetBackReport` plugin in `plugins/` (built from `NPC_bot/paper/set_back_report`); without the plugin the
+fleet fails on Paper. Paper is the base the intelligent siege monsters will be written on. Each folder keeps
+`server-26.1.jar`; copying it back to `server.jar` returns a seat to vanilla. A world opened on Paper 26.1.2
+cannot be reopened on vanilla 26.1, so the way back for a world is a snapshot taken before. The invariant
+below still holds: no bot code names Paper. The 2026-09-11 ruling that follows is superseded for this
+machine's seats and kept for its reasoning.
+
+**RULING 2026-09-11, delegated by the Architect** (*"only make paper native if its backwards compatible…
+if theres a set of problems that happen with paper and specific problems that happen without paper then
+we keep it seperate"*). **This section previously said the opposite — "put Paper on every machine's dev
+world" — and that instruction is withdrawn.** Its reason ("test what you run") was written when one
+particular Paper server was the only target; the 2026-09-10 open-source ruling made a stranger's vanilla
+server an equal first-class one, and that is the fact that moves the answer.
+
+**Each flavour has its own problem set, which is the case his test says keeps them apart.** Vanilla-only:
+a 12,797 ms tick stall from vanilla chunk handling, which timed out a whole fleet. Paper-only: entity
+activation ranges, mob spawning and chunk behaviour — the layer a pathfinding bot sits on, and a vanilla
+user never meets it. Paper also does **not** fix the disconnect it would be adopted for: the 30-second
+keep-alive lives in vanilla's packet handler and Paper exposes no key for it.
+
+**THE INVARIANT THAT ACTUALLY BUYS COMPATIBILITY — NO BOT CODE MAY BRANCH ON SERVER FLAVOUR.** The fleet
+is a mineflayer client speaking the vanilla protocol and holds zero references to Paper, Spigot, Bukkit or
+activation ranges. That is what makes it run anywhere, by construction rather than by testing, and it is
+the thing to protect. A jar choice is not what keeps the bot portable; never writing `if (isPaper)` is.
+
+**Which world is which** (runbook §3h): `MinecraftServer/` is the LOCAL dev world every soak uses — keep
+it **vanilla**, because it is the harsher substrate and the lower common denominator, and testing on the
+harsher while shipping to the more forgiving is the safe direction. Any world serving other people is
+likely to be Paper plus an anticheat, which is a *more* forgiving substrate than the one soaked against.
+
+**Converting a dev world to Paper is an OPT-IN parity check, not a setup step** — worth doing deliberately
+when the question is *"does this behave the same under Paper?"*, and worth reverting after. Server folders
+never travel through git, so each machine does this for itself. `$S` below is YOUR server folder — whatever
+`AUREN_SERVER_DIR` names, which `node js_kernel/utils/workstation.js server` will print:
+
+```
+$S = & node js_kernel\utils\workstation.js server
+# The version is READ from the one authored answer, never typed here (Law 16) — a number written into
+# this block is a second answer that goes stale the day the fleet moves, which is what happened to the
+# `1.21.5` that used to be on these two lines. Pick the highest build id rather than channel STABLE: a
+# just-released version's Paper builds are all ALPHA. If Paper has no build for it yet, that is a reason
+# to stay vanilla rather than to pin the fleet backwards.
+# architect_config requires through the module aliases, so they are registered first.
+$ver = & node -e "require('./Auren_Workshop/workshop_paths').registerAliases(); process.stdout.write(require('./Thinking_fragments/architect_config.js').SERVER_MINECRAFT_VERSION)"
+# Paper may publish only a hotfix of the version (26.1 has 26.1.1 and 26.1.2, no 26.1). Use the hotfix only
+# when minecraft-data gives it the same protocol number as $ver, and read the result as hotfix plus Paper.
+$b = Invoke-RestMethod "https://fill.papermc.io/v3/projects/paper/versions/$ver/builds" -Headers @{'User-Agent'='auren'}
+$dl = ($b | Sort-Object id -Descending | Select-Object -First 1).downloads.'server:default'
+Copy-Item "$S\server.jar" "$S\server-vanilla.jar"        # keep the way back
+Invoke-WebRequest $dl.url -OutFile "$S\server.jar"
+```
+
+`fleet_control.js` launches `server.jar` by filename, so reverting is a `Copy-Item` back. Paper's extra
+configs land inside that same folder. PaperMC's v2 API is sunset — use v3 as above; its builds array is
+descending and the artifact key is `server:default`.
+
+**Parity check, 2026-11-23 (second seat, rollback, normal, 15 bots, `--ends built`): FAILED.** Paper 26.1.2
+build 74 (protocol 775, the same as 26.1) set bodies back mid-step 3,648 times in 25 minutes (`--steps`:
+3,680 failed steps, 4,513 bot-seconds held); a vanilla 26.1 run on the third seat had 1 set-back in 26
+minutes. Paper logged nothing. The headframe stood at 11m14s (vanilla about 7 min); no shaft, pen or hive
+followed, and the watch woke at 24.7 min on AurenBot looping on a chest it could not reach. Not separated:
+Paper against the 26.1.2 hotfix, since Paper has no plain 26.1 build. Seat reverted to vanilla afterwards.
+
+**Cause and fix, the same day.** Paper's `PlayerFailMoveEvent` named every refusal `CLIPPED_INTO_BLOCK`: a body
+standing exactly against a block face. A Paper seat runs the fleet with the plugin `NPC_bot/paper/set_back_report`
+(its README has the build), which lets a body that only touches a face stand and still refuses a real overlap.
+Proof: 15-minute rollback, 15 bots, PASS 5/5, 0 set-backs, headframe 9m21s. The bot code is unchanged; nothing in
+`Auren_Bot/` names Paper.
+
+### 2a. `MinecraftServer/` is gitignored — server config does not travel
+
+`server.properties`, `ops.json` and `world_snapshots/` are untracked on every machine. **When a bot
+misbehaves on ONE machine only, suspect untracked server config first.**
+
+**Nothing to do by hand.** `fleet_control.js` holds `REQUIRED_PROPS` and writes each one into
+`server.properties` before launch, on every machine, every run. Add new must-have settings there, never
+to a table in a document. A server already running cannot be re-configured (these load at JVM start), so
+`fleet_control` reports the mismatch and tells you to restart.
+
+**Currently asserted: `spawn-protection` = `SPAWN_PROTECTION_RADIUS` from `architect_config.js` (16, the
+vanilla default).** The launcher reads the same constant the bots gate their decisions on, so the square
+the server enforces and the square the fleet avoids cannot drift.
+
+**What the setting does.** Inside a Chebyshev square of that radius around world spawn — X/Z only, full
+height, so 16 means a 33×33 column bedrock to sky — the server refuses block breaks *and* placements by
+non-op players, **silently**: no revert, no error, nothing the client can see. mineflayer writes AIR into
+its own world model anyway (`finishDigging` → local `_updateBlockState`), so the bot believes it dug a
+hole that does not exist, hovers over phantom air, collects nothing, and strands itself.
+
+**The fleet holds the rule itself.** `perception_nodes.js/spawn_protection` latches world spawn off the
+server's own `spawn_position` packet and gates target selection, the route search, and both
+world-altering verbs. A protected cell is refused before the swing, with a named cause.
+
+**The gate ignores op status**, so an op'd bot is refused exactly like a non-op one (Law 19,
+Invariant E). `ops.json` lists AurenBot (level 4) and not TessaBot; that asymmetry no longer changes
+behaviour.
+
+**What it costs, so a run is read correctly.** Ground within 16 of world spawn is off-limits for mining,
+building, farming, lighting and bridging — trees there are not candidates, patches there are not
+prospects, and a build site straddling the edge is rejected whole. Walking, standing, fighting and
+collecting drops inside the square stay legal. Both real build sites (headframe `(32,68,-1)`, farm
+`(18,62,43)`) sit outside the radius. **A scan reporting `held by spawn protection` is this rule
+working.**
+
+---
+
+## 2b. Pointing the fleet at a world on another machine
+
+**`Auren_Bot/foreman_config.js` is the single source** (Law 16, 2026-09-11). `SERVER_ENDPOINT` in
+`Thinking_fragments/architect_config.js` is a re-export of it and nothing else, so the two can never
+disagree; every body, the foreman, the camera rig, the seed scanner and `run.js` all land on that one
+file. It is also the one page a downloader is expected to open, which is why it sits at the top of the bot
+rather than inside a fragment.
+
+Its defaults are `localhost:25565` and console port `25575` — a server on this machine, started and left
+alone. **Nothing probes, scans or falls back to a second address.** When nothing answers, `run.js` stops
+and prints that file and the field to change, which is the whole reason a fixed default is safe.
+
+**Override it by environment for a run that points elsewhere** — an edit travels through git and is wrong
+everywhere but one machine:
+
+```
+$env:AUREN_SERVER_HOST = '100.x.y.z'      # the server's TAILNET address
+$env:AUREN_SERVER_PORT = '25565'
+```
+
+`fleet_control` spawns bots with `{...process.env}`, so a value set in the launching shell reaches every
+body. A malformed port falls back to 25565.
+
+**Use the tailnet address.** The public entrance is an authenticating proxy that demands a Mojang login
+the bots do not have.
+
+### Testing latency without a server: `tools/latency_shim.js`
+
+A TCP relay that holds every byte for a set delay:
+
+```
+node Auren_Workshop/tools/latency_shim.js --listen=25567 --target=127.0.0.1:25565 --delay-ms=60 --jitter-ms=15
+$env:AUREN_SERVER_HOST='127.0.0.1'; $env:AUREN_SERVER_PORT='25567'
+node start_auren.js --where remote                          # joins the shim instead of starting a world
+```
+
+`--delay-ms` is the ROUND TRIP; each direction is held for half. At 60 ms the fleet holds, and the
+friction it adds concentrates in inventory acknowledgement waits.
+
+---
+
+## 2c. The seed scanner — getting a world worth starting a fleet on
+
+The fleet sites its base inside the ~160-block radius the server streams around the landing point, so a
+world is judged by what is in that one circle.
+
+> *"landing biome is forest or plains. theres rivers and medium amount of water content and the ground is
+> reletivley flat, no giant mountains or oceans spanning a large portion of the loaded chunk."*
+> — Architect, 2026-09-05
+
+```powershell
+# HUNT — roll seeds until one is ideal. Unattended; ~20 s per seed. Stops at the first world that passes.
+node Auren_Workshop/tools/seed_scanner.js scan --tries=14
+
+# MEASURE — score the world the server is running right now. Creates nothing, deletes nothing.
+node Auren_Workshop/tools/seed_scanner.js measure
+
+# THE RECORD — every seed ever scanned, and which criterion did the rejecting.
+node Auren_Workshop/tools/seed_scanner.js log
+```
+
+Per seed the hunt stops the JVM, deletes the candidate world folder, writes `level-seed`, starts the
+server, joins one spectator-weight client (`Seed_Scout`), reads the biome map with the fleet's own
+`biome_scanner`, walks a 441-column relief grid, judges, records, and rolls on. No fleet, no foreman, no
+autonomy.
+
+| criterion | default | owner |
+|---|---|---|
+| landing biome is a forest/plains type | `world_forge.ACCEPTABLE_BIOMES` | **his** — one list, imported |
+| a river body inside the loaded area | 160 b | **his** |
+| share of ground standing under water | 2–22 % | the tool's |
+| share of the loaded area that is ocean | ≤ 8 % | the tool's |
+| ground-height spread, 5th to 95th percentile | ≤ 40 b | the tool's |
+
+Override with `--max-relief=`, `--max-ocean=`, `--min-water=`, `--max-water=`, `--max-river-dist=`. Every
+verdict line prints **who owns the number it judged against**.
+
+**The thresholds were calibrated against `sub_agent_01`** — the world he called ideal: *forest landing ·
+12.4 % of ground under water · 0 % ocean · nearest river 107 b · ground y32–y94, median y64, p5–p95
+spread 32 b*. Re-derive any time with `measure`.
+
+**Two water numbers, two questions.** `ocean %` comes from the biome map (is this an ocean world);
+`ground under water %` comes from the relief columns (how much buildable ground is flooded) and is what
+the "medium water content" band judges — a pond inside a forest is invisible to the biome map.
+
+**Which worlds it may destroy:** the guard is a property test — **any world that has a snapshot is
+somebody's world and is refused.** The candidate world defaults to its own name, `seed_scan`.
+
+```powershell
+# once the hunt finds one, this makes it permanent AND makes the scanner refuse to overwrite it
+node Auren_Workshop/tools/seed_scanner.js keep --world=seed_scan
+```
+
+**The hunt leaves the foreman running the candidate** so you can look at the world it found. Put it
+back when done: `node Auren_Workshop/fleet_control.js verb shutdown`, then set `level-name` in the
+server's `server.properties` back to the world you run on.
+
+`level-seed` is restored on every exit path including a crash.
+
+**The permanent record** is `Long_term_memory/seed_scans.jsonl` — append-only, holding the measurements
+rather than the verdict, so rows stay readable after a threshold moves. `seed_scanner.js log` is its lens.
+
+**Measured over 18 seeds:** ocean and water content reject ~69 % of seeds each, landing biome 62 %,
+flatness 31 %. A 14-seed hunt found one on attempt 11 in 4.4 minutes, unattended. **The seed of the world
+he has now is `5584697676702229955`.**
+
+---
+
+## 3. Start a run — ONE PAGE, ONE SCRIPT
+
+> *"instead of different scripts to start the test. theres one way law 16 on how to do it. then theres one
+> way to configure it. you make all the configurations before you start anything on one page then you
+> click the same runscript and it runs according to the configure. so standar, continue, watch, record,
+> soak, waking rules. everything that is througout all the runbook verbs are now all on a configuration
+> page and the one script runs them after you configure them."* — Architect, 2026-09-10
+
+> *"run.js is to be removed… the foreman finds a spot, places the bots no faux human needed… foreman
+> should do all the critical stuff like checking no windows are open, start the cameras, watch for errors
+> and wakes. so fold everything into foreman. its all now foremans job."* — Architect, 2026-09-18
+
+**One page and one script, and there is nothing else to learn.**
+
+```
+1.  edit    Auren_Bot/foreman_config.js           THE RUN, as one sentence, then what goes around it
+2.  run     . .\Auren_Workshop\scripts\_node.ps1 ; $n = Get-AurenNode ; & $n start_auren.js
+```
+
+The foreman reads the page once, before the world moves, and the run then performs itself start to
+teardown with nothing to steer. A flag on `start_auren.js` overrides one field for one run (`--help`).
+
+### 3a. THE RUN IS THE FOREMAN'S SENTENCE (Architect 2026-09-18)
+
+> *"what happens on a run goes into the config. so in my head it reads like a sentence. rollback test 30
+> minute soak, homesteader is a config and a sentence it can be constructed in code without making the
+> sentence. it goes in order… then when foreman starts, it reads all of that and runs everything as
+> planned."*
+
+`Auren_Bot/foreman_config.js`, in its order — the same page a stranger edits for `start_auren.js`:
+
+| field | permitted values | what it decides |
+|---|---|---|
+| `where` | `local` · `remote` | the foreman starts the server in `serverFolder` and stops it at the end · it joins somebody else's world and never starts or stops it |
+| `start` | `rollback` · `continue` | the bots start knowing nothing, and a local world is put back to its clean copy · nothing is emptied or put back |
+| `soak` | minutes | how long the run lasts once the crew is working. `0` runs until stopped |
+| `difficulty` | `peaceful` · `normal` (default) · `hard` | the difficulty the foreman writes into server.properties (architect_config.CREW_DIFFICULTY). `peaceful`: no night gate, no spawn proofing, and wheat only where the hive or its pens ask for it. `normal` or `hard`: the night gate closes outdoor work, the crew grows wheat to eat, and the base is lit against spawns (support_need). The difficulty changes nothing else: the crew carries the same kit, sword and shield included, and lights its mine alike |
+| `build` | empty (default) · any downloaded building listed there | a large build apart from the base, raised last (architect_config.LARGE_BUILD). Every crew raises the headframe first as its bootstrap, then the bot hive on the nearest plot beside it (HIVE_SITING) and the rest of the base round them. A named large build is sited on the nearest plot outside the whole base (LARGE_SITING) and raised once the hive stands; the hive and the large build each hold their own plan (downloaded_plan_registry.of). Empty: `ends built` waits for the hive |
+| `plan` | a path, or empty | where a large build's plan lives; empty looks where the workshop writes plans |
+| `count` | whole number, 2 through the available roster | how many bots the foreman raises; defaults to 15, overridden for one run with `--count 2` |
+| `landing` | `usual` (default) · `random` | a rollback start of a crew the foreman raises: the nearest good ground to world spawn · a spot rolled each run 2 to 4 loaded areas (two view-distances wide each) from the usual one, re-rolled up to 8 times when the ground refuses the base (`startup_steps` "a random landing that holds the base is found"; the door publishes `run.landing`) |
+
+**One crew** (Architect 2026-11-09): *"so i want the hive tower to be the standard for all runs. to eliminate builder/homesteader both combined into one.. we should make headframe standard. so headframe, hive tower, large build. the hive tower will be in exchange for the laydown yard. so now we have one config page. no matter what, headframe, as the bootstrap to build the hive tower. then we keep night gate and such but instead of making a homestead vs builder, everything depends on difficulty of the server. if its peaceful then no night gate. if normal or other then it gets the wheat field and spawn proofing and night gate."*
+
+**The hive is a support** (Architect 2026-11-09): *"60 blocks is too far... The separate part should be the big build. So headframe and bot tower which is specifically designed to have a small footprint should be closer to each other. Can we make sure the support structures all kind of stay together. Because mining, farming, herding and logistics should stay together. But the big build can be far away because it only needs delivery and building... So now the hive is a support structure, the headframe and shaft."*
+
+**The clean copy** a rollback start restores is `<server folder>/world_snapshots/<world>/<world>_fresh_start`
+(`foreman_plan.freshWorld` is the one statement of that name; the benches read it too). The world being
+replaced is DELETED: no program saves a world, and a world worth keeping is saved by hand before the run
+(`world_rollback.ps1 -Action snapshot`). A server folder with
+no clean copy is used as it is, and the foreman says so. Make one with `world_rollback.ps1 -Action snapshot`.
+
+**The foreman carries it out** (`foreman/foreman.js` `runThePlan`): check the sentence (a field that makes no
+sense stops everything before the memory, the ports or the world are touched) → empty the memory on a rollback
+start → restore and start the world → join → stand its own body on the nearest
+landing spot clear of world spawn (`landing_spot`), wait for the ground there, and raise the crew through
+`getCrew` → start the soak timer → at its end,
+the one shutdown road. The door publishes where it has got to as `run` (`crew`, `soakEndsAt`, `closing`).
+
+**A `continue` start moves nobody.** The foreman's body stays where it logs in, the spot search and the
+stand are not part of the run, and the crew is launched with no placement, so each body starts on the cell
+the last run left it on (`getCrew` `resume`, `foreman_plan.continues`). The base is the one in memory; a
+continue with no base in memory is refused at "the base is sited and in memory" (`nothing_to_continue`).
+
+**After a crash, the kind of crash picks the next start** (Architect 2026-10-21: *"if theres a loop crash then
+you make a change then you can continue to see if you broke the loop. if theres a law 13 coding violation or
+something else that isnt looping then you have to code something then restart."*):
+
+| the run stopped on | next start | why |
+|---|---|---|
+| an INFINITE LOOP (a body stuck repeating one job) | fix, then `--start continue` | the world and the bodies keep the state that made the loop, so the continue reproduces it at once and shows whether the fix broke it, without replaying the run up to that point |
+| a CODING VIOLATION (Law 13) or any other fault that is not a loop | fix, then `--start rollback` | nothing about the stopping state needs reproducing; the fix is proved on a clean run |
+
+**Each chest is forgiven one mismatch per run.** A chest whose window does not match its last picture
+after 5 s is taken as it stands and its picture rewritten, once per chest per run — the foreman counts it
+(`chest_forgiveness:<station>` in `foreman_brain`, spent, never held). The body warns `CHEST PICTURE
+FORGIVEN`; a second mismatch on that chest in that run is the coding violation it was.
+
+### 3a-bis. The inspection run — looking over what the last run built
+
+```
+node start_auren.js inspect            # the base the last run left
+node Auren_Workshop/fleet_control.js down
+```
+
+`inspect` is `--test inspect --start continue --clock day` (`foreman/utils/test_modes.js`, row `inspect`).
+The ordinary startup runs up to "the camera is at the build" and stops there with the run left open:
+
+- the world comes up as the last run left it, and nothing is put back, emptied or swept;
+- the base is read back from the fleet's memory and proved whole, with no body raised;
+- the one camera window a person flies (`Cam_Inspector`) is raised with no bot window, whatever
+  `record`, `cameras` and `architect.enable` say, and the foreman puts it at the base's alpha structure
+  (the headframe);
+- midday is pinned, and the run stays up until `verb shutdown`, `down` or Ctrl-C.
+
+Any other `start` is refused before a record is swept. On every camera run, a seat the cameras step raised is placed at the build
+when no `observer` is named.
+
+### 3b. What the foreman adds around the run — the same page, after the sentence
+
+`windowsPriority` in `foreman_config.js` selects `high` (default) or `normal`, overridden for a
+launch by `AUREN_WINDOWS_PRIORITY`. On Windows the foreman sets and reads back this CPU scheduling
+class for itself, every bot it launches, and the local Java server it launches. Each result is
+recorded as `PROCESS PRIORITY`; denied or unread settings are explicit warnings. Other operating
+systems keep their own scheduling. Remote servers and desktop/security programs retain their settings.
+High gives fleet threads preference over ordinary desktop work and can reduce desktop responsiveness
+under sustained CPU load. It reserves neither RAM nor storage bandwidth. The thirty-second watchdog
+benchmark remains in force. Set `windowsPriority: 'normal'` to restore ordinary fleet scheduling on
+subsequent launches; process-specific settings end when those processes exit.
+
+The run script's admin became the foreman's on 2026-09-18 (the ruling quoted at the top of §3). Each is a
+startup step the foreman proves like any other (`foreman/utils/admin_steps.js`), or its watch
+(`foreman/utils/run_watch.js`):
+
+| field | permitted values | what it decides |
+|---|---|---|
+| `clock` | `dawn` · `day` · `held` | sunrise and let it run · pin midday and FREEZE the cycle · leave it alone. Set through the console and READ BACK |
+| `record` | `off` · `cameras` · `film` | nothing · cameras only · cameras plus a recorder writing files (a machine with a recorder; a download refuses `film`). Raised as a child process (`record_overlay.js raise`), taken down in shutdown |
+| `watch` | `true` · `false` | the foreman ENDS the run at the first stop in `wake` · every stop off, the clock alone ends it and the verdict says it all |
+| `wake` | any of `error` · `loop` · `crash` · `death` · `lost` (all, the default) | the stops that end a run early, each a toggle on the run's end page `run_end_config.js`: `error` any other error line · `loop` the judge's INFINITE LOOP / AB OSCILLATION kill · `crash` a body's IMPOSSIBLE STATE / STUCK FOR / KEEPER_UNVERIFIED (off, that body alone ends) · `death` the hub's count of ☠️ DIED · `lost` a body gone that the foreman did not send home (a crashed body is one, so running past a crash needs `crash` and `lost` off). The Architect sets it. **Every run ends on its clock**: `soak` is above zero, and 0 is refused |
+
+**Before any of that, the foreman refuses to start while a terminal from an earlier run is open** — it
+names them and closes nothing (*"check but not close"*, 2026-09-11); `fleet_control.js down` closes them.
+
+**At the end it says PASS or FAIL**, from its own fleet state frozen before the bots are sent home: the
+startup was proved step by step · the crew worked its window out · no bot reported an error · the crew that
+started is the crew that finished. It prints the checks, writes `fleet_logs/run_outcome.json`
+(`foreman/utils/run_outcome.js`), and exits 0 (PASS) · 2 (FAIL after a working run) · 1 (startup failed) —
+`start_auren.js` passes that code through, so a session waiting on the process reads the outcome off it.
+
+**Every field is a whitelist** (`foreman_plan.check`). A value that is not on its list is refused BY NAME
+before anything moves (Law 13).
+
+### 3c. What moved, and what was deleted (2026-09-18)
+
+- `crew`, `soak` → foreman_config. `memory: 'clear'|'keep'` → `start: 'rollback'|'continue'`.
+- The `hosting` block (`world`, `snapshot`, `worldName`) → `start: 'rollback'`; the snapshot name is derived.
+- **`host_and_run.js` is deleted.** It checked for leftovers, rolled the world back, started the server and
+  ran `run.js` as a child. The foreman now starts and restores the world for everybody.
+- **`run.js` and `run_config.js` are deleted** (same day, later). The clock, the cameras, the open-terminal
+  check, the watch and the verdict moved into the foreman (§3b). **Dropped, not moved:** the stand-in person
+  (`person`, `standing`) — `tools/proxy_human.js` still seats one by hand; `stream` and `teardown: leave-up` (a wake now always
+  ends the run); the preflight gate (preflight is the workshop's, and the bot does not reach the workshop —
+  run it yourself after a code change); and the headframe clock grade at the end (a lens reads a finished
+  run: `trace_monitor.js --milestones`).
+
+
+### 3e. The bots arrive the way a stranger's bots arrive, and there is no other door
+
+The foreman stands its own body on a landing spot clear of world spawn and raises the crew its run page
+names through `getCrew`. It hears nothing in chat; it says the run's beats there (a structure built, a
+layer released: `utils/run_announcer`), for the recording.
+
+You and a stranger launch the same `start_auren.js` with the same page, so there is no environment the
+run can inherit that a download does not have.
+
+**There is no privileged entrance left.** The old named tests ran `start_bot.js` and handed it a mandate,
+which is a door nobody who downloads this has. If the foreman refuses, the run has failed — there is
+nothing to fall back to, deliberately. *"i dont want to test in a way that a public user wont be using."*
+
+**THE DOWNLOAD COPY IS GONE (2026-09-10) and the two paragraphs that stood here with it.** They explained
+why the copy lived outside the repository (`node_modules` resolves by walking UP, so a copy inside the tree
+satisfies itself from the repo's own install and proves nothing) and what was carried across a rebuild.
+Since the workshop moved inside the bot, **the tree in place IS the shipped tree** — there is nothing to
+copy and nothing to carry. The deleted `run.js`'s `clearMemory()` header (in git history) holds the three
+faults the copy cost.
+
+**What survives from that second paragraph is one fact worth keeping:** the bots'
+`corporate_headquarters.<bot>.json` files and `player_memory/` are untracked runtime state and are the two
+halves of what a bot knows, so they move together. That is `start: 'rollback' | 'continue'` on
+foreman_config (2026-09-18) — one field covering both, never two that could disagree. A rollback start on a
+server with no clean copy still empties them, so a stranger can have a clean-slate crew on their own world.
+
+### 3f. Where the old verbs went
+
+Nothing was lost; each was one frozen combination of the settings above.
+
+| what you used to run | what to set now |
+|---|---|
+| `test rollback` | foreman_config `start: 'rollback'`, `soak: 15` |
+| `test continue` | foreman_config `start: 'continue'` |
+| `test scan` | foreman_config `soak: 1` |
+| `test record` | `run.record: 'film'` |
+| `test spawnzone` | `run.standing: "<coords inside the square>"` |
+| the two foreman tests | the foreman comes up in every run before any crew is raised |
+| the two let's-play runs | `run.record: 'cameras'`, `run.teardown: 'leave-up'` |
+| `test arena` | `lanista` still owns the arena — it asks `foreman_plan.freshWorld` which world and clean copy |
+| the conductors' soak / capture / triage | foreman_config `soak`, `run.record`, `run.watch` |
+| `run <profile>` / `runbook` | the page IS the profile; there is only one |
+| `stranger_bench` | this is it — the method became the plumbing |
+
+**Deleted on 2026-09-10:** `tools/stranger_bench.js`, `tools/test_conductor.js`,
+`scripts/fresh_start.ps1`, `scripts/scan_test.ps1`,
+`scripts/start_fleet.ps1`, `fleet_runbook.js`, and `fleet_control`'s `test`, `run` and `runbook` verbs.
+Each of them started a fleet, and each carried its own bring-up order — which is how this repository came
+to hold three separate answers to *"is the world restored before or after the bots come down"*.
+
+### 3g. The plumbing that stayed, and why
+
+> *"i still want the same type of plumbing. a configurable start that is deterministic."*
+
+**The foreman brings a world up; `fleet_control.js` stops, inspects and drives it** (2026-09-18). The
+foreman's startup is a list of steps, each one acted, then proved from the world, before the next begins
+(`foreman/foreman_steps.js`); the verbs that used to walk a bring-up in a fixed order (`server-start`,
+`snapshot-restore`, `up`, `local`, `bots-up`, `foreman-launch`, `foreman-start`, `bot-start`) are deleted.
+A bench that needs a world asks the foreman through `bench_world.js`.
+
+```
+node Auren_Workshop/fleet_control.js status | snapshot | clock dawn|day|held | down | repair
+                                     rcon "<command>" | verb <word> [--bot=X] | verb shutdown | memory-wipe
+node Auren_Workshop/fleet_control.js snapshot --name=<label> --memory  |  restore --name=<label>
+```
+
+**A save point is a world and the fleet's memory of it, kept together** (Architect 2026-11-17: *"take a
+snapshot of the world and the bots memory"*). With the server stopped, `snapshot --name=<label> --memory` copies the world into
+`<server>/world_snapshots/<world>/<label>` and the memory (`foreman/fleet_memory`: every headquarters file
+and `player_memory/`) into `<server>/memory_snapshots/<world>/<label>`. `restore --name=<label>`
+refuses while the server is up, puts the world back, then lays that memory back over an emptied memory, and
+the next run is a `--start continue`. A rollback start would empty both again, so never use one after a
+restore. A save point is never overwritten; `memory-wipe` and a rollback start empty the same parts.
+
+### 3h. Publishing is a CONVERSATION, not a step in the run
+
+> *"its not a determinitic process. we test a feature and then once its working you remind me to post it
+> to public. its a manual process because it has to survive code changes. were never testing the same
+> thing and errors will always be different. so the workflow is verbal not coded."* — Architect,
+> 2026-09-10
+
+A green run ends by saying the build is postable and **stops there**. There is no `--publish`, and there
+was one for exactly one day: it gated a push on a passing bench, which measures the one feature that run
+exercised and certifies the whole tree. Since no two runs test the same thing, that gate was an
+inference the machine had no standing to make.
+
+The order of a release is therefore: **change → run → look at what it says → say so out loud → he
+posts.** The private trunk carries every iteration through `session_sync`; the open-source repository
+gets a snapshot copy of `Auren_Bot/` with no history, the day a build works.
+
+---
+
+## 3h. The local server — a world on this machine, for testing
+
+`node start_auren.js --start continue --test world` brings up this machine's own world with the foreman and **no bots**; `down`
+takes it away again. Address `localhost`, Java Edition 26.1, world folder under `MinecraftServer/`. It prints
+no ONLINE — that word belongs to a server strangers can reach, and on a world only this machine can reach
+every step of that check is meaningless or cannot fail.
+
+**The hazard, and the guard.** `AUREN_SERVER_HOST`/`PORT` override where every body connects, and
+`fleet_control` hands children `{...process.env}` — so a shell pointed at some other server earlier would
+start a world on this machine and send the bots and the foreman into **that** world. The
+foreman reads where the world is from `foreman_config.js` (`where: 'local'`), so a local start is local.
+
+```
+node start_auren.js --start continue --test world   # world + foreman, NO bots
+node Auren_Workshop/fleet_control.js down                             # world + foreman down
+# there is no -Count any more: a crew is raised by a configured run (§3)
+```
+
+Then join in Minecraft at **`localhost`** (Java Edition **26.1**) if you want to look around.
+
+**It comes up with zero bots on purpose**: the foreman's `world` test brings the world up, reads its spawn and
+stays open until stopped, for a bench whose subject is the world itself. A crew is raised by an ordinary
+configured run (§3).
+
+**A rollback start opens a WORLD's records** — `start_auren.js` empties `fleet_logs/` on a rollback start
+and on nothing else. A continue start adds a segment to every file; nothing else deletes a record. A fleet
+run from its own copy of the bot keeps its own `fleet_logs/`; a lens reads it with `--records=<dir>`.
+
+**A note the proving produced:** a bot launch returns when the PROCESS is launched, while a
+body enters the foreman's registry only after it connects, spawns and `master_core` initialises — those
+are seconds apart. The foreman polls the registry for up to 90s rather than reading it once. **Only a real
+player slot catches faults of this shape**: `preflight` passed throughout, every process window was
+clean, and the only thing wrong was a sentence said to a human about a fact that had not happened yet.
+
+---
+
+## 3i. The filming overlay — one word films any conducted run
+
+> *"i want an overlay that can attach deterministically to any known way to start the bots… controllable
+> with a single command and everything else is automated."* — Architect, 2026-08-16
+
+Filming attaches to a rung rather than becoming rungs of its own. Say the word after the run's name:
+**rollback record test** → `rollback record`.
+
+| | |
+|---|---|
+| `record` | cameras for every bot, and a recorder writing every one to its own file (needs a recorder on this machine) |
+| `watch` | the same cameras, **nothing written** |
+| *(no word)* | today's run, unchanged byte for byte |
+
+```
+# a filmed run is a CONFIGURED run: set record: 'film' (or 'cameras') on foreman_config.js, then:
+node start_auren.js                                        # or: node start_auren.js --record cameras
+node Auren_Workshop/tools/lanista_conductor.js ladder record
+node Auren_Workshop/tools/record_overlay.js    stop        # THE closer — from any other terminal
+node Auren_Workshop/tools/record_overlay.js    status      # what is filming, and who is holding it
+```
+
+**A held start (`--go held`, `foreman_config.go`)** raises every bot and places it at the build before any
+of them works, so the cameras are set up while the crew arrives. Once every body stands, the foreman sets the
+clock back to dawn (rollback) and releases the bodies one at a time, each after the one before has moved
+(step "the crew has its go"). The soak counts from the release.
+
+**The Architect's eye (`Cam_Architect`)** is one more spectator client, built and launched like a bot
+camera, that the director **arms and then never commands**. It is absent from the rig's shot list, so
+nothing can teleport it. On a recorded run it gets its own capture and its own file. Its name
+and on/off state are declared in `camera/camera_configure.js` (`architect.camName`, `architect.enable`).
+It defaults off — it is the only seat producing nothing unless a human is in it for the whole run.
+`lanista_conductor` still takes `--architect`, having no authored run to read. Full section:
+`camera_runbook.md` §8.
+
+**Every filmed run also records what the MACHINE did.** The overlay raises
+`tools/machine_load_sampler.js` *before* the cameras — chunk streaming as N clients launch is the load
+worth catching — and reaps it with the crew:
+
+```
+node Auren_Bot/monitoring/trace_monitor.js --machine-load            # newest record
+node Auren_Bot/monitoring/trace_monitor.js --machine-load --label=rollback
+```
+
+GPU utilisation, VRAM, temperature, power, clock, CPU and free RAM as **p50/p95/max**, plus **stalls**
+(how late a sample landed). **It reports machine load, never smoothness** — a hitch is a late frame and
+nothing outside the game process can see one, so headroom here is evidence the card was not the limit.
+
+**Where it sits in a run:** after the bring-up, before the work — one insertion point on every rung. A
+filmed conducted run brings its fleet up IDLE (`fleet_control test <name> --idle`) and the conductor
+sends `verb start` once the lenses are watching.
+
+---
+
+## 4. Cold-start sequence (the wheat-farming prototype baseline)
+
+**This is a CONFIGURED run, and §3 is how it is asked for.** The sequence — terminal check → restore the
+clean copy → up → clock → [cameras] → the foreman raises the crew → soak → verdict → teardown — is performed
+by the foreman. On `foreman_config.js`:
+
+```
+where:  'local'
+start:  'rollback'     restores <world>_fresh_start (the server's level-name picks the world)
+soak:   15
+difficulty: 'normal'
+build:  ''             the base and its bot hive; a large build is not built yet
+clock:  'dawn'
+record: 'off'          | 'cameras' for a seat to watch from | 'film' for footage
+```
+
+Then `node start_auren.js`. There is no `-Count`: the run page's `count` is what the foreman raises.
+
+**`.\Auren_Workshop\scripts\fresh_start.ps1` used to be this command and is deleted** (2026-09-10). It
+raised bots by running `start_bot.js` directly — a door nobody who downloads this repository has — so a
+cold start proved through it was never evidence about the build a stranger gets.
+
+**The clock has three answers, and each states the whole clock** — the time it starts at AND whether the
+day/night cycle then advances. Written as `clock:` on the config page, and settable at any moment on a
+live world with `node Auren_Workshop/fleet_control.js clock <name>`.
+
+| | |
+|---|---|
+| `dawn` | sunrise, and the day runs on from there. The default, and what the fleet is normally exercised against |
+| `day` | **pinned at midday, cycle frozen** — it never gets dark. For a take you will repeat, and for any untimed session that must not walk into a night nobody asked for |
+| `held` | whatever time and cycle the world already holds. The deliberate night run |
+
+`doDaylightCycle` lives in the world's `level.dat`, so it survives a run — which is why every answer
+sets the cycle as well as the time rather than only the half it cares about.
+
+The steps it composes, for running one in isolation:
+
+1. **Restore the world snapshot, empty the memory and bring the foreman up** — one start, each step proved
+   before the next: `node start_auren.js --start rollback --test world`
+2. *(folded into 1)*
+3. *(folded into 1 — a rollback start empties the memory before the world restores)*
+4. **Wire check:** `node Auren_Workshop/tools/preflight.js` — every fragment must load before trusting a run.
+5. **Raise a crew:** an ordinary configured run (§3) — `node start_auren.js --start continue`.
+6. **Watch for errors** (§5) and **inspect** (§6).
+
+
+**A rollback test rolls the world back; a continue does not.** Without the rollback, prior-run cruft
+accumulates — three headframes stacked up across carry-forward runs, and multiple tagged chests
+(`[chest headframe]` at several sites) coexist, so the supply system can draw wheat and seeds from a chest
+belonging to a *different* site's headframe. `rollback.ps1 -Action restore` deletes the
+world it replaces.
+
+### Editing `building_blueprints.json` — a stopped-state input
+
+**Edit the file freely at any time, including while the fleet is running, then restart the bots to apply
+it.** A **continue test** applies a blueprint edit without rolling the world back.
+
+The running fleet holds a snapshot taken at boot (`js_kernel/blueprint_registry.js`, the one route to the
+file) and never re-opens it:
+
+- **Deleting the file to upload a new version crashes nothing.** Nothing re-reads, so the delete window
+  is invisible to the fleet.
+- **A completed edit does not take effect mid-run, and that is the point.** The dangerous case is the
+  swap that *succeeds*: bots then compare a world built to blueprint A against blueprint B, nothing is
+  malformed so nothing throws, and the integrity scan concludes the structure is damaged and posts repair
+  work that tears down correct blocks.
+- **The mismatch is reported.** The registry hashes the file and warns at `⚠️` when disk differs from the
+  running snapshot: `building_blueprints.json CHANGED ON DISK (boot <hash> → disk <hash>) … THE EDIT IS
+  NOT LIVE`. Missing-file and file-returned are reported the same way.
+
+A missing or corrupt blueprints file **at startup** throws — that is the boot validation (Law 13), and it
+is what carries this claim now that the mid-read bench is retired.
+
+---
+
+## 4a. Self-cleaning starts and the mid-run recovery path
+
+**A rollback start self-cleans; a continue start keeps everything.** On a rollback `start_auren.js` empties
+`fleet_logs/` whole, then launches fresh. On a continue every `watcher_*.jsonl` and `console_*.log` is
+appended to, each run its own segment (`--run=N|all` on a lens).
+
+**HQ memory is never touched by a start** — only `verb flush` clears `corporate_headquarters*.json`. Logs
+flush on every start; the memory does not.
+
+**There is no cross-run combat memory of any kind, and that is the ruling** (Architect 2026-08-31): the
+fleet changes between runs, so rows written a week apart never measured the same system. What lasts is
+the write-up someone makes from a session.
+
+**Recovery on a mid-run wake:** stop bots only — `verb stop` (persists tail state; foreman and server
+stay up) — inspect, fix the code, then `verb shutdown` and start again with `node start_auren.js --start continue`. **No `verb flush` on this path** —
+flushing would discard the in-progress HQ the stall interrupted.
+
+---
+
+## 5. Wake on error (the watch contract: errors wake, warnings sleep)
+
+**Any `❌` error stops the system for inspection; warnings sleep through — and are never left unread.**
+
+### What a `⚠️` warning means
+
+**A warning says: *look at this, but nothing is broken and it can wait until the regular timed
+inspection.*** Both halves bind:
+
+- **"Nothing is broken"** — the work completed, the plan was valid and used, the world is consistent, no
+  state was lost. A warning is the level for a **degraded-but-correct** outcome: it cost more than it
+  should have, or took a worse route to a right answer.
+- **"But look at it"** — a real finding filed for scheduled review.
+
+**If a thing is actually broken it is `❌` and it stops the run. If it merely cost more than it should
+have it is `⚠️` and it waits.** **Emit a non-fatal condition at `warn()`**: a non-fatal error is permanent
+in the trace and `--watch` wakes on errors at **any** index, so every re-arm re-wakes on the same
+historical line, forever, with no new event. The SLOW-NAV tripwire did exactly that and broke the attended
+loop inside 8 minutes.
+
+**The level IS the interface, and the prose is not.** `trace_monitor` consumes a *level*; a sentence
+reading "NON-FATAL, BOT CONTINUING" is addressed to a human and invisible to it. **Anything said only in
+the message text has not been said.** Say it in the level.
+
+### Inspecting warnings — on a schedule, always
+
+**On EVERY wake — an error wake or a clean 15-minute timeout — read the run's warnings first:**
+
+```
+.\Auren_Workshop\scripts\trace.ps1 --level=warn --from=<last check-in>    # every warning since the previous inspection
+.\Auren_Workshop\scripts\trace.ps1 --level=warn --from=<t> --bot=TessaBot # narrow when one bot is noisy
+```
+
+Of each warning ask:
+
+1. **Is it new, or the same one I saw last check-in?** A warning recurring across several check-ins has
+   become a chronic cost and has earned a decision.
+2. **Is it growing?** Same warning, worse number is a trend, and a trend is a finding.
+3. **Does it point at a structural fix nobody has made?** Most warnings name the candidate fix in their
+   own text.
+
+The sleep is a **deferral to the check-in**. A warning nobody ever read is the design failing.
+
+**Two warning signatures wake immediately:** `warn-repeat` (3× identical warn text) and `warn-burst` (5+
+warns within 60s from one bot). A warning storm is degradation happening now.
+
+Two ways to run the watch:
+
+- **Bare monitor:** `node Auren_Bot/monitoring/trace_monitor.js --watch --exit-on-flag --max-minutes=<N>`
+  Exits `2` the instant it flags. It wakes on an error at **any** index, including one already in the
+  trace when the watch began. Warnings and the progress-shaped signatures stay new-lines-only. Without
+  `--watch` it is a one-shot scan (exit `0` clean / `2` flags / `1` read error).
+- **Attended wake:** run the bare monitor **in the background** from the chat. A background task the
+  session started re-invokes that session when it exits, so its **exit-on-flag IS the wake**. On wake the
+  fleet stays up: query the trace's "after" (§6), diagnose, and only then stop bots by hand if a code
+  edit is needed.
+
+**The signatures:** `error` (any ❌ — always wakes), `death` (§5a — always wakes), `judge-repeat`
+(recursive_judge Contiguous N/5), `warn-repeat`, `warn-burst`, `silence` (a bot went quiet while the fleet
+ran — the dead-bot fingerprint), `regression` (a structure's correct-count fell), `halt` (recursive_judge
+parked a bot). Thresholds are calibrated at the top of `trace_monitor.js`.
+
+### Working while a run is going — the standard (Architect 2026-10-19)
+
+A run is not a wait. While the soak runs, inspect its traces through the lenses and keep making changes,
+above all while a subsystem is new: a fresh subsystem is watched until it is reliable. Check-ins are
+periodic; their spacing varies with what is being watched (about every 10 minutes while a subsystem is
+fresh). At each check-in, in this order:
+
+1. Errors, deaths and new warnings since the last check-in (the list above).
+2. **Every job taken since the last check-in**, with its claims and bot-minutes
+   (`trace_monitor --accounting`, `labour_by_job` and `waste_by_job`), read for waste: a job that should
+   not exist, a job taken more often than its work warrants, a job that states no result.
+3. The subsystem being hardened, read through its own lines or lens.
+
+A code change made mid-run reaches the next run. A file the run loaded at its start (a build plan, a
+blueprint) is changed for the next start only.
+
+### 5a. Wake on death
+
+**A bot dying is not an error in the trace** — the construct respawns and carries on. The death wake
+lives in `trace_monitor` as the `death` signature, so there is one watch:
+
+```
+node Auren_Bot/monitoring/trace_monitor.js --watch --exit-on-flag --max-minutes=60
+```
+
+### 5b. Reading a fight — `trace_monitor --engagement`
+
+The fight told back as a story, off the bot's own trace. Read it together with `lanista`, which names the
+outcome off the server.
+
+### 5b-bis. Making a fight happen — `lanista`, the arena bench
+
+```
+node Auren_Workshop/tools/lanista.js --bot=AurenBot                          # one zombie, ~12 blocks out
+node Auren_Workshop/tools/lanista.js --bot=AurenBot --mob=creeper --rounds=3 # three fights, re-sited each time
+node Auren_Workshop/tools/lanista.js --bot=AurenBot --mob=skeleton --hand=minecraft:bow --range=15
+node Auren_Workshop/tools/lanista.js --bot=AurenBot --mob=zombie --count=3   # three at once, spread by bearing
+node Auren_Workshop/tools/lanista.js --bot=AurenBot --buddy=TessaBot --buddy-gap=1 --wave=zombie:3 --rounds=3 --same-ground --kit=iron_axe,shield,iron_helmet,iron_chestplate,iron_leggings,iron_boots
+                                                                             # two bodies in one fight; --same-ground pays the arena search once
+node Auren_Workshop/tools/lanista.js --bot=VedaBot --wave=skeleton:1@bow,zombie:2 --loot  # after each wave: what the body picked up, what it left within 10 b
+node Auren_Workshop/tools/lanista.js --cleanup                               # kill anything it left behind
+node Auren_Workshop/tools/lanista.js --bot=Striker --striker --lead=50 --mob=creeper --kit=iron_sword --lift=0 --range=8 --rounds=6
+                                                                             # lanista's own body: never moves, swings on recharge
+node Auren_Workshop/tools/arena_set.js --place=200,~,200                     # the filming colosseum, placed whole (about a minute)
+node Auren_Workshop/tools/lanista.js --bot=VedaBot --arena --time=noon --wave=creeper:1 --rounds=8 --escalate --stage=6 --kit=iron_sword,iron_helmet,iron_chestplate,iron_leggings,iron_boots
+                                                                             # the fight in the colosseum: round n is n× the wave, one life
+node Auren_Workshop/tools/lanista.js --bot=VedaBot --arena --time=noon --show=emperor --emperor --crowd=10 --kit=iron_sword,iron_helmet,iron_chestplate,iron_leggings,iron_boots
+                                                                             # the filmed show (tools/arena_show.js): the show's rounds in order, each
+                                                                             # staged until the release button in the emperor's box is pressed; the
+                                                                             # thumbs levers put the crowd's banners up (puppets from the operator's npc module)
+node Auren_Workshop/tools/lanista.js --bot=VedaBot --arena --time=noon --show=emperor --board --crowd=10 --guard --kit=iron_sword,iron_helmet,iron_chestplate,iron_leggings,iron_boots
+                                                                             # the same show run from the When Board (tools/when_board.js): open
+                                                                             # http://127.0.0.1:7711/ on a second monitor; --board=<port> moves it
+```
+
+**The When Board (`tools/when_board.js`, `--board`)** is a page the show process hosts on this machine and closes with
+the show. One button per cue, each showing its state in words and colour (green on, red off, grey not usable now, amber
+busy or armed). It says when; the unit that owns the act says how. `--board` implies `--emperor`: a board press counts as
+the button or lever in the box, and both work at once.
+- **Release**: lets the staged wave out; after the last round, dismisses the crowd.
+- **Thumbs up / Thumbs down / Lower banners**: the crowd's banners. They go up one spectator at a time, each on its own
+  temper (eager, ready, late, and a doubter who raises the other banner first). The state is read
+  off the puppets' own hands.
+- **Drop the TNT** (two presses): `--tnt=<n>` (default 16) lit TNT summoned under the awning over the sand. It wrecks the
+  set; place it again with `arena_set.js --place` before the next show.
+- **Start / Stop recording**: grey on a machine with no recorder (`workstation.findRecorder()`), or while no recorder
+  process is up. Each call runs in a child process, so the show's loop and the puppets' connections never stall on it.
+
+**`--crowd`, `--guard`, `--ruler` are the show's people, not the swarm.** They are puppets from the operator's own npc
+module (`workstation.findNpc()`); a copy with none refuses the three flags and runs the arena with nobody watching.
+`--guard` stands two guards in diamond armour either side of the throne (`arena_set` design point `guards`); `--ruler`
+puts ArchitectBot on the throne in gold armour. They never move, watch the fighter, and are creative like the crowd.
+
+**The colosseum (`tools/arena_set.js`)** is a filming set, not a crew build: one design read by the Studio draft
+(`html and json/Structure Studio/stage_set_draft.js` writes `roman_colosseum`), the placement, and lanista's `--arena`
+mode. `--place=<x>,~,<z>` finds the ground there, clears the box, fills stone under the footprint down to 40 blocks so
+it never floats, places it bottom-up with lanterns last, reads three blocks back, and keeps the centre in
+`arena_set_book.json` under the world's name. **A rollback start puts back a world without it**: place it again after
+every rollback (lanista refuses `--arena` when the read-back fails). `--arena` puts the body on the centre stand, takes
+one cell from each of the four gate pens in turn, shuts the bars before the summon, holds the wave `--stage` seconds
+(default 6), opens every gate at once, and turns mob griefing off while it runs. `--time=noon` is refused for a wave
+holding a mob the sun burns: the oculus is open sky over the centre. `--escalate` multiplies the wave by the round
+number and ends the run the round the body falls.
+
+**`--striker`** needs only the server (`start_auren.js --start continue --test world`), no fleet and no `sentry`.
+lanista brings its own body (`tools/lanista_striker.js`) under `--bot`'s name. The body never moves and swings at
+the mob once it is in 3.0 b reach and the held weapon has fully recharged. Each round prints the swings, the
+creeper's closest approach, the gap between the server's position updates, and whether the fuse lit. The verdict counts
+**kills with the fuse never lit**. `--lead=<ms>` judges reach at the mob's predicted position `<ms>` past now instead of
+its last reported one. The server reports a walking mob only every ~150 ms. Without the prediction, a creeper crosses
+the whole space between the hit range (~3.4 b centre to centre) and the fuse range (3.0 b) between two updates.
+Measured 2026-11-17 (Worklog 761): no lead, 0 of 16 fights the creeper entered won with the fuse unlit; `--lead=50`, 15/16 on flat ground.
+
+**It records nothing** — the bot writes its own combat onto its watcher trace and `--engagement` reads it.
+Three things it does, each because a live run proved it had to:
+
+- **Authors the world to midnight / hard / daylight-cycle off.** The first match ever run reported
+  *"✅ field cleared in 30s"* against a bot that never swung — daytime was 3442 and the zombie burned.
+- **Reads the mob's equipment back.** `/summon minecraft:skeleton` arrives with NO bow, and a bow-less
+  skeleton has no ranged attack in Java — it charges and bashes. `--hand` is verified against the server;
+  a mob that did not take it means the round is **NOT RUN**.
+- **Refuses rather than mislabels.** Terrain that cannot supply the asked range reports asked-vs-got; a
+  bot outside its own `AGGRO_RANGE` is NOT RUN rather than timed out; a cleared field with no damage
+  dealt is not a win; a creeper that detonated is called a detonation.
+
+It never moves, heals or re-kits the bot — it fights from where it is with what it has. **It does not arm
+engagement**: a parked bot needs the operator's `sentry` verb.
+
+**A wave ends when the battle ends, never on a clock** (Architect 2026-08-07: *"there is no wave timer,
+its upon completion of battle"*). `--ceiling=<sec>` (default 90) is only the point past which an
+unresolved wave is recorded as a **timeout — a defect reading, not a result**. On the fleet's side
+`battle_stations` reports which entity ids it killed and which disengaged, the `sentry` watch ends its
+wave on that report, and `recursive_judge` judges it and re-arms for the next.
+
+**Run the one-wave smoke before you spend a ladder.** A ladder is many trials; a wiring fault costs the
+whole run to discover. One wave costs under a minute on the identical path:
+
+```
+node start_auren.js --start rollback --only VedaBot --soak 60 --landing usual --wake error,loop,crash,lost
+                                                      # world + one body, an hour at most; it starts on its own
+node Auren_Workshop/fleet_control.js verb sentry --bot=VedaBot   # once it has started: ARM engagement, stop the planner
+node Auren_Workshop/tools/lanista.js --bot=VedaBot --mob=zombie
+node Auren_Workshop/fleet_control.js down             # between trials that need a fresh process (an env switch)
+```
+
+The body starts itself (`BOT_AUTOSTART`); wait for its `START_INJECTOR` lines (`trace_monitor --tag=start_injector`)
+before `sentry`. **Never send `verb start` to a body that already started**: its second `bot_minutes.open()` is a
+coding violation and the watch ends the run. `--wake error,loop,crash,lost` (death left out) keeps a death in the arena from ending the run.
+`lanista_conductor` still brings up through `fleet_control test arena`, which was deleted on 2026-09-10; until it
+is moved onto this route, conduct a ladder by hand on it.
+
+**Four things in that output are the gate**, and any one missing means stop and fix: the siting line names
+a real `asked vs got` range; the lift line shows the mob placed at or above `--lift` blocks over the bot,
+or says it fell back to the confirmed pool; the headline is a **cleared** or a **disengaged**, never a
+`⏱️ timed out` (a timeout on wave one is almost always `sentry` unarmed); and
+`trace_monitor.js --engagement --bot=AurenBot` afterwards shows the fight.
+
+### 5b-ter. Auditing sight — `raycast_crucible`
+
+Answers *"was the bot right about what it could see?"* against ground truth that is never the thing under
+test.
+
+```
+node Auren_Workshop/tools/raycast_crucible.js                              # where the body spawns
+node Auren_Workshop/tools/raycast_crucible.js --at=32,70,-1 --radius=8     # a chosen stance, ±8 cube
+node Auren_Workshop/tools/raycast_crucible.js --skip-blocks --ring=2,3,5,8 # just the fight-gate ring
+node Auren_Workshop/tools/raycast_crucible.js --explain=25,66,-2           # ONE ray, printed cell by cell
+```
+
+It joins as a **spectator**, needs only the server, and kills every body it summoned on every exit path
+including a throw. Four audits:
+
+| phase | the question, and what answers it |
+|---|---|
+| **W** | is the client's block map TRUE? Every sampled cell put to the server over RCON |
+| **C** | does the ray stop at the FIRST collision shape? Every cast re-walked by a **different algorithm** — prismarine steps a 3D DDA, the crucible sweeps the segment parametrically and does exact ray/AABB against every shape. Two implementations agreeing is evidence; running one twice is not |
+| **M** | the ENTITY channel — summoned bodies vs the server's own list, position error included |
+| **R** | the near-field ring: the production predicate at every bearing and close range, every refusal re-walked before it is believed |
+
+**Read the classes, never the raw disagreement count** — which way the two answers differ *is* the
+finding:
+
+- **STOPPED-EARLY** — the ray stops nearer than the true first blocker: the line is called blocked when it
+  is clear, and the bot refuses a monster it can see.
+- **MISSED-NEARER** — it stops past a real blocker, or not at all: the bot charges a mob through a wall.
+- **CORNER (◹)** — the segment passes exactly through a cell corner; prismarine's tie-break steps into a
+  cell the ray is inside for zero length and stops on it. Same stopping distance, different cell named.
+  Reported because **whether the SERVER breaks that tie identically is unverified** — the one open parity
+  question the tool leaves on the table.
+
+A high ◹ count means the stance is cell-aligned; re-run from `--at` elsewhere.
+
+### 5b-ter-bis. One behaviour inside a real crew — the test module
+
+`--module <name>` raises the crew as usual, but every time a body would plan, `recursive_judge` hands the turn to
+`action_fragments.js/test_module` instead of `job_board`. The module runs its one test under every rule and reports
+back to the judge; once it has run, the chain ends and the body stands where the test left it.
+
+```
+node start_auren.js --start rollback --soak 30 --only VedaBot --module walk --module-biome jungle
+node monitoring/trace_monitor.js --finder        # [decoration_locates] / [decoration_walks] carry TEST_LOCATE / TEST_WALK
+```
+
+`walk`: the foreman asks the server for the nearest `--module-biome` and the body walks there by the finder's own
+walk (`sector_finder.walkToward`), timed. A run with a module is not judged on walking against working.
+
+### 5b-quater. Testing one piece of a bot live — `testbot`
+
+> *"read fleet runbook and use testbot. thats how you test individual pieces of bots live"* — Architect,
+> 2026-08-11
+
+**A `testbot` is a standalone mineflayer client that joins the running server and `require`s the REAL unit
+under test.** It is not a roster entry and never boots `master_core`. **It needs the SERVER only** —
+`node start_auren.js --start continue --test world` is the whole bring-up. That independence matters because a fleet bot's
+login can be bricked by its own playerdata, and then every verb-driven bench is unavailable for a reason
+unrelated to the thing being measured.
+
+```
+node start_auren.js --start continue --test world   # the entire prerequisite
+node Auren_Workshop/tools/water_pillar_probe.js                   # scaffold_movement.pillarStep, live
+node Auren_Workshop/tools/combat_drive_probe.js                   # combat_navigator + gunner, live
+node Auren_Workshop/tools/build_bench.js <blueprint> [--keep]     # build_executor on any blueprint, ~1 min
+```
+
+**`build_bench` is the one-minute answer to "does the builder build this blueprint".** It lays a stone pad
+off spawn, gives one survival body exactly the blueprint's materials over RCON, runs the real
+`build_executor` with `test: true`, and reads every voxel back off the world — including an optional fifth
+voxel element, the block state the cell must show (`test_house` carries thirteen: stairs in every
+direction and both halves, and a chest, all from one stand). It names no blueprint and
+carries no expected count, so it moves with the code. Its header holds why the materials are given rather
+than simulated, and why it stands in for `recursive_judge` in its own process.
+
+**A probe that drives a SCANNER audits the verdict independently or it proves nothing.** It re-derives every
+field of the scanner's answer from `bot.blockAt` directly, never through the scanner's own voxel reader — sharing
+the reader would make a reader defect invisible — and reports find rate separately from soundness rate: **a high
+find rate with one unsound answer is a FAILING result.**
+
+**The four seams every probe has** (long form:
+`Documentation/designs/live_test_bench_design_note.md`): **connect** the client · **author**
+the scenario over `tools/rcon_link` · **call** the real unit, required and never reimplemented (Law 16) ·
+**judge by reading the world back**, never by trusting the unit's own success flag (Law 26).
+
+**The governing line:** *anything Minecraft decides is READ; only the operator's choices are AUTHORED.* A
+probe that computes what an action should have done has become a simulator, and a simulator confirms the
+bug you already believe.
+
+**Which bench for which question:** `lanista` causes a FIGHT (outcome off the server) ·
+`locomotion_course` drives the A* ladder over sited terrain through the `move` verb (needs a fleet) · a
+`testbot` probe drives ONE unit in isolation (needs a server).
+
+### 5c. Arena tapes are released every run
+
+**Every start deletes every arena tape** (`fleet_logs/arena/*.jsonl`), the same way it clears the
+watcher traces. No combat record survives a run boundary.
+
+Arena tapes are released but never folded: `tools/locomotion_course` is their only writer and only reader
+— it samples a movement leg at 20 Hz and reduces its own output. **A tape that cannot be reduced is NOT
+deleted**; it is left on disk and named loudly in the reset line.
+
+**The costs, so a missing number reads as a decision:** there is no lifetime time-to-kill by mob and
+weapon, no all-time blows-taken-by-species, and no run-over-run comparison. A question of that shape is
+answered by RUNNING a ladder.
+
+The two fight-quality reads that survive into `--engagement` are the ones the bot could answer about
+itself: **blows thrown from beyond the bot's 3.0 reach** and **an engagement with no strike at all**.
+
+---
+
+## 6. Inspect a run (`trace_monitor` — read-only, never touches a bot)
+
+> **Where the instruments live.** Everything that READS a record is in `Auren_Bot/monitoring/`;
+> `Auren_Workshop/tools/` is bench-testing — anything that drives the system to *make* a record. The test:
+> could it run with no Minecraft installed? Then it is monitoring. `monitoring/README.md` holds the split;
+> `monitoring/LENSES.md` holds every question and the flag that answers it.
+
+Default trace is `fleet_logs/traces/watcher_fleet.jsonl`, merged on read with every per-bot file. Run
+from the repo root.
+
+> **Node resolution.** The bare `node …` form works where `node` is on PATH. On a portable-node machine
+> use `.\Auren_Workshop\scripts\trace.ps1 <same args>` — same resolver chain, every flag forwarded verbatim.
+
+```
+node Auren_Bot/monitoring/trace_monitor.js                    # digest + anomalies (exit 2 if problems)
+node Auren_Bot/monitoring/trace_monitor.js --story            # one block per job: PLAN -> DOING -> VERDICT
+node Auren_Bot/monitoring/trace_monitor.js --activity         # the decision play-by-play
+node Auren_Bot/monitoring/trace_monitor.js --story --bot=AurenBot          # follow one bot
+node Auren_Bot/monitoring/trace_monitor.js Auren_Bot/fleet_logs/traces/watcher_TessaBot.jsonl  # one bot's own file
+```
+
+**Query mode — the addressable slice.** Take one flagged, timestamped line and pull the window around it,
+before AND after, or filter by subsystem tag / bot / time range. All filters compose (AND); it never flags
+and never wakes (exit 0):
+
+```
+node Auren_Bot/monitoring/trace_monitor.js --around="1m 1s"                 # DEFAULT: ±25 lines around it
+node Auren_Bot/monitoring/trace_monitor.js --around="1m 1s" --lines=50      # ±50 lines
+node Auren_Bot/monitoring/trace_monitor.js --around="1m 1s" --bot=TessaBot  # narrow so the anchor is YOUR line
+node Auren_Bot/monitoring/trace_monitor.js --around="1m 1s" --window=60     # opt into a TIME window (±60s)
+node Auren_Bot/monitoring/trace_monitor.js --tag=STATION_REGISTRY           # one subsystem, whole run
+node Auren_Bot/monitoring/trace_monitor.js --from=4m --to=7m --bot=AurenBot # a bot, minutes 4–7
+node Auren_Bot/monitoring/trace_monitor.js --grep="goTo failed" --level=error
+```
+
+The anchor window defaults to a **line count** (±25 matching lines): a time window explodes with a fast
+multi-bot fleet (5 bots × ~10 lines/s × 60s ≈ 3000 lines), so `--window`/`--before`/`--after` are opt-in.
+Relative `[Nm Ss]` stamps reset on each `start`, so a relative query is scoped to one run segment
+(`--run=<latest|N|all>` widens). An ISO stamp addresses across runs.
+
+**Is a bot actually silent? Use `--last`.**
+
+```
+.\Auren_Workshop\scripts\trace.ps1 --last     # one greppable LASTPOST line per bot, from each bot's OWN file
+```
+
+```
+LASTPOST AurenBot POSTING age=1s at=2026-07-20T12:57:26.281Z story="Progress: 22.6 blocks remaining ..."
+LASTPOST TessaBot POSTING age=0s at=2026-07-20T12:57:27.231Z story="goTo reached 'goal' — at (59,63,-44) ..."
+```
+
+`--last` reads the per-bot watcher files and ignores the merged stream, so it answers the question even
+when the merge is missing, empty or lagging — which is exactly when the question gets asked. The digest's
+`last activity` is derived from the merge and freezes when the merge lags; it prints an `own file:` line
+beside it and a `⚠️ MERGE-LAG` marker naming which line to trust.
+
+**Cross-check liveness when a run looks stalled:** `node Auren_Workshop/fleet_control.js status` (are the PIDs alive?) and the
+ISO stamp on the **last line** of `fleet_logs/traces/watcher_<Bot>.jsonl`. The append-only writer means
+nothing rewrites the file, so mtime moves only when a line lands; the last line's own stamp is still the
+better read, since it survives a file being copied or restored. `--watch` also flags a wall-clock **FLEET
+FROZEN** when no bot has logged for >120s with no error raised.
+
+**Watcher levels (Law 5):** `summary()` (📊, the primary channel), `warn()` (⚠️, read first when
+diagnosing), `error()` (❌, auto-dumps buffered context). Nothing finer-grained exists by design.
+
+---
+
+## 7. Where things live
+
+- **Operative static** (checked in, at `Auren_Bot/` root): the structural laws, this runbook, and
+  `camera_runbook.md`. Must exist on both machines cold.
+- **Live runtime exhaust** (`Auren_Bot/fleet_logs/`, gitignored): fleet consoles
+  (`server/foreman/trace.log` + one `<BotId>.log` per roster entry), the arena tapes, and
+  `fleet_control_runtime.json`. **The entire directory is emptied at the start of every `up`** — by
+  clearing the room rather than matching filenames, so a record added by a future instrument cannot
+  quietly outlive its run. Also gitignored: `corporate_headquarters*.json`, `find_buildingspot.json`, and
+  the server's `usercache.json` / `server.properties` / `world_snapshots/`.
+- **Cross-run memory is `js_kernel/corporate_headquarters*.json` and nothing else** (gitignored,
+  per-machine, cleared only by `verb flush`) — where home is, which chests are whose, what has been
+  sited. It survives a start because the fleet READS it in order to work; that is the whole test.
+  **Long-term memory is a markdown holding the interpretation someone drew from a run**, tracked in
+  `Documentation/` or `Cognitive_documents/`.
+- **Documentation** (`Documentation/`): static reference and archive.
+
+---
+
+## 8. The attended hardening loop
+
+### THE STANDING RULE: no LLM runs in an unattended loop
+
+**An LLM may not be placed in a loop that acts on the system without a human present in it.** Not bounded
+by attempts, not bounded by a budget, not bounded by a permission list. This has been built and removed
+**twice** — `autofix_controller.js` / `launch_subagent.js` / `start_subagent.ps1` / a `claude -p` fixer
+(deleted 2026-07-10), and a waker that escalated a watchdog fault by starting a headless session (built
+and deleted the same day, 2026-09-05). *"I've tried this at different scopes and it just never works."*
+
+**The previous note recorded a *situation* — "it existed to run with nobody in the chat; that premise is
+gone" — and a situation is exactly the kind of reason a later session argues past.** The premise came back
+the day strangers could join a live server, so the note read as spent, and the second version was built by
+a session that had read it. The reasons below are structural and none expires:
+
+1. **It inverts Law 13.** Default state is stopped; a system must prove it is safe to CONTINUE. An
+   unattended fixer is default-*running* — it acts on the fault and halts only after proving N failures.
+   Attempt ceilings, watchdogs and budgets are stop-conditions bolted onto a thing already going.
+2. **A generator cannot supply the proof Law 13 asks for.** It has no throw: it can complete while
+   producing a well-formed falsehood, so it cannot certify its own safety to continue, and unattended
+   there is nobody the certification could be checked against (Law 26).
+3. **The dilemma that kills it on either horn.** If the repair is well-understood enough to be safe
+   unsupervised, it is well-understood enough to be *deterministic code* — and the LLM is unnecessary. If
+   it is not that well-understood, the LLM is unsafe. **Prefer a calculator that fails over a process that
+   can run away.**
+4. **It reaches into the engine while it turns** (Law 26). An LLM editing code and restarting services on
+   a live server is authoring internals of a running machine.
+
+**THE RELIABLE LOOP, and it is the Architect's (2026-09-05):**
+
+> *"code shows problem, LLM interprets issue to me, i make a decision, LLM writes code, code runs without
+> LLM."*
+
+Four hops, and the human is a **link in the loop, not an escalation path off the end of it.**
+Deterministic code detects and reports (it cannot lie while it runs); the LLM *translates* and later
+*authors*, both while the system is stopped; the human *decides*; the code that ships runs alone.
+**Automating the human hop is what both deleted systems were, and it is the hop that cannot be automated
+— it is the only one where a decision is made by a party that can be held accountable for it** (Law 28).
+
+**What IS legitimate:** deterministic self-repair with a named owner and a cause-naming alert — a watchdog
+that restarts a component, backs off, gives up after a fixed number of attempts and posts *why*. It
+contains no generator, cannot invent an action it was not built with, and when it runs out of moves it
+wakes a *person*. Extend that, and let the escalation end at a human.
+
+### The loop, one turn at a time
+
+It runs *attended* — the AI Developer sits in the chat and IS the fixer — using the two tools that exist:
+`fleet_control` (operate) and `trace_monitor` (observe).
+
+**The wake mechanism.** A detached OS process cannot inject a turn into a live chat, but **a background
+task the session itself launched re-invokes that session when it exits.** So the watch runs in the
+background, watches the live trace, and exits on the first error; that exit is the wake. A long
+`ScheduleWakeup` is a fallback heartbeat if the watcher ever hangs instead of exiting.
+
+1. Bring the fleet up and start autonomy:
+   ```
+   node start_auren.js --soak 60
+   ```
+   The foreman restores the world, sites the base, raises the crew and proves each step (`foreman_config.js`
+   says which crew); `--soak` is the run's clock, and every run has one (`run_end_config.js`): set it as long as the run needs.
+2. Launch the watch **in the background**:
+   ```
+   node Auren_Bot/monitoring/trace_monitor.js --watch --exit-on-flag --max-minutes=60
+   ```
+3. On a flag it exits `2` → this session wakes, the flag's context in its output. **The fleet stays up.**
+   Query the window around the flag (§6), diagnose against the laws. **Then read every warning since the
+   last check-in (§5)** — on every wake, error or clean timeout.
+4. If a code edit is needed, stop bots deliberately (`verb stop` — keeps the world and in-progress HQ),
+   `verb shutdown`, edit, `preflight`, then `node start_auren.js --start continue`.
+5. Re-arm the background watch. Repeat.
+
+**The stop-tuple holds (Law 8).** A start binds server+bots as one unit; a stop binds bots+server. The
+watch never tears the fleet down, so **teardown is yours** — `fleet_control down` or `takeover`. A server
+is left running only if the session ends with the fleet up, and `status` + `takeover` from any shell
+recover it.
+
+**Multiple test worlds.** `fleet_control … --world=<name>` repoints the server to any world folder under
+`MinecraftServer/` (it writes `level-name` before launch — a live server cannot be re-pointed). **An
+unknown name makes Minecraft generate a fresh world of that name**, which is how a new test world is born;
+each world keeps its own `rollback.ps1` snapshots. With no `--world`, `fleet_control` runs whatever world
+is already selected. **A test world stays.** A world or test server a session raised is not a throwaway: it is left
+in place, and up, after the test (Architect, 2026-10-27); a flat world is the one exception. A throwaway helper
+script still goes in the turn that made it.

@@ -1,0 +1,640 @@
+// fragment: locomotion_dispatcher
+// purpose: The Law 15 doorway into the locomotion sub-loop. Exposes goTo and births each inner
+//          chain's payload (Law 8 origin), always routing to navigator, which terminates at
+//          locomotion_judge.
+//
+// role: goTo births a payload → navigator walks A* → locomotion_judge verdicts back: 'success'
+// resolves the caller's promise, 'retry' dispatches a fresh chain (judge owns the budget),
+// 'failure' resolves arrived=false for the caller to re-plan.
+//
+// invariants: writes nothing to the caller's payload (Law 15); one pending invocation at a time
+// (Law 4); malformed goals/missing bot throw (Law 13); state lives in module memory (Law 9) and
+// Watcher lines (Law 5); an emergency override drops routing at the bus, abandoning the pending call.
+//
+// ---------------------------------------------------------------------------
+// SECTION 1: Dependencies
+// ---------------------------------------------------------------------------
+// watcher required at load (Law 5); signal_bus required lazily (avoids the circular load through
+// fragment_registry). Law 1: nothing is required from locomotion_judge.
+// ---------------------------------------------------------------------------
+const watcher = require('@kernel/watcher');
+// A FORWARDING router: calls route() with an upstream author's own from/to, so it cannot use
+// signal_utils' helpers (they would stamp `from` as this caller).
+const signalBus = require('@kernel/signal_bus');
+
+// ---------------------------------------------------------------------------
+// SECTION 2: Configuration constants
+// ---------------------------------------------------------------------------
+// (reserved for future dispatcher-level tuning; routing constants live in the rungs)
+
+// ---------------------------------------------------------------------------
+// SECTION 3: Pending-invocation memory (Law 9 module-level scratch state)
+// ---------------------------------------------------------------------------
+// Holds only what cannot travel in a payload: the resolve function, identity, start time (the
+// request and try count live in the payloads, Law 1). invocationCounter flags a stale verdict.
+// ---------------------------------------------------------------------------
+let pending = null;        // { invocationId, verb, resolve, startedAt }
+let invocationCounter = 0; // monotonically increasing invocation id
+// A REPLACED WALK STILL OWES ITS CALLER AN ANSWER (Law 8). A walk is replaced while its own chain is still turning
+// when a fight opens at that chain's step (the gate at the walker's loop boundary) and the fight's spoils walk takes
+// the slot. The replaced caller is suspended until its chain's own verdict comes back, late; that verdict settles it
+// here, as `replaced`. A caller is never woken while the chain it waits on is still running, and never left unsettled.
+// invocationId → the replaced pending record. Bounded: an entry leaves on its chain's verdict, and REPLACED_MAX caps
+// chains that never return one.
+const replaced = new Map();
+const REPLACED_MAX = 16;
+
+// ---------------------------------------------------------------------------
+// SECTION 4: Goal validation and normalization
+// ---------------------------------------------------------------------------
+// Two legal goal shapes (D6 — no policy parameters): { x, y, z }, or { candidates_ref,
+// candidates_count, candidates_kind } naming a perception file of targets (Law 6). Anything else is a coding violation (Law 13).
+// ---------------------------------------------------------------------------
+
+// validCoordinate: true when c is an object with finite numeric x/y/z.
+function validCoordinate(c) {
+  return !!c && ['x', 'y', 'z'].every(k => typeof c[k] === 'number' && Number.isFinite(c[k]));
+}
+
+// normalizeGoal: convert either accepted goal shape into { coordinate, candidates_ref,
+// candidates_count, candidates_kind }. Throws on malformed input (Law 13).
+// stepBudget: the caller's cap on how many steps of the planned route one walk may take, or null for the
+// whole route. A walk that spends it stops where it stands and says so; the caller decides what follows.
+function stepBudget(verb, goal) {
+  if (goal == null || goal.max_steps == null) return null;
+  if (!Number.isInteger(goal.max_steps) || goal.max_steps < 1) {
+    throw new Error(`[locomotion_dispatcher] CODING VIOLATION: ${verb} max_steps must be a whole number ≥ 1. Got: ${JSON.stringify(goal.max_steps)}`);
+  }
+  return goal.max_steps;
+}
+
+function normalizeGoal(verb, goal) {
+  if (validCoordinate(goal)) {
+    return { coordinate: { x: goal.x, y: goal.y, z: goal.z }, require_los: goal.require_los === true, required_side: goal.required_side || null, min_y: goal.min_y != null ? goal.min_y : null, max_y: goal.max_y != null ? goal.max_y : null, walk_only: goal.walk_only === true, leading: goal.leading === true, spare_builds: goal.spare_builds === true, avoid_body: Array.isArray(goal.avoid_body) ? goal.avoid_body : null, exact: goal.exact === true, max_steps: stepBudget(verb, goal), candidates_ref: null, candidates_count: 0, candidates_kind: null };
+  }
+  if (goal && typeof goal.candidates_ref === 'string' && goal.candidates_ref && Number(goal.candidates_count) > 0) {
+    return {
+      max_steps: stepBudget(verb, goal),
+      coordinate: null,
+      candidates_ref: goal.candidates_ref,
+      candidates_count: Number(goal.candidates_count),
+      candidates_kind: goal.candidates_kind || 'candidate'
+    };
+  }
+  throw new Error(
+    `[locomotion_dispatcher] CODING VIOLATION: ${verb} requires {x,y,z} or {candidates_ref, candidates_count>0, candidates_kind}. Got: ${JSON.stringify(goal)}`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// SECTION 5: Chain dispatch (Law 8 origin — every inner payload is born here)
+// ---------------------------------------------------------------------------
+// Births the inner payload and routes it to navigator, from the API call (attempt 1) or a judge
+// retry echo. The `locomotion` capsule is the sub-loop's typed instruction contract (Law 10):
+// goal fields as normalized above; require_los/required_side/min_y/exact — arrival tolerance;
+// attempt — which dispatch this is (judge owns the budget); invocation_id — ties the verdict back.
+// ---------------------------------------------------------------------------
+function dispatchChain(request) {
+  // A missing goal means the API validation was bypassed or a judge verdict was authored wrongly (Law 13).
+  if (!request || (!validCoordinate(request.coordinate) && !(typeof request.candidates_ref === 'string' && request.candidates_ref))) {
+    throw new Error(`[locomotion_dispatcher] CODING VIOLATION: dispatch request carries no valid goal. Got: ${JSON.stringify(request)}`);
+  }
+
+  const bot = global.bot;
+  // A movement request can only come from a running caller (Law 13).
+  if (!bot?.entity?.position) {
+    throw new Error('[locomotion_dispatcher] CODING VIOLATION: movement API invoked with no bot loaded.');
+  }
+
+  const goalText = request.coordinate
+    ? `(${request.coordinate.x},${request.coordinate.y},${request.coordinate.z})`
+    : `${request.candidates_count} ${request.candidates_kind} candidates in ${request.candidates_ref}`;
+
+  const nextRung = 'navigator';
+
+  const payload = {
+    from: 'locomotion_dispatcher',
+    to: nextRung,
+    task: nextRung,
+    readable: `locomotion_dispatcher: dispatch ${request.verb} attempt ${request.attempt} via ${nextRung}`,
+    locomotion: {
+      verb: request.verb,
+      coordinate: request.coordinate,
+      require_los: request.require_los || false,
+      required_side: request.required_side || null,
+      min_y: request.min_y != null ? request.min_y : null,
+      max_y: request.max_y != null ? request.max_y : null,
+      walk_only: request.walk_only === true, // a route with no dig and no place edge (drop_collector's strip chase)
+      leading: request.leading === true,     // a route an animal is led along: no dig_down, no pillar (herd_executor)
+      spare_builds: request.spare_builds === true,   // a route that may not dig or cover any build (herd_executor)
+      avoid_body: Array.isArray(request.avoid_body) ? request.avoid_body : null,   // cells a line-of-sight stand may not fill ("x,y,z")
+      exact: request.exact || false, // arrive standing ON the target cell; default false keeps ~1.5 tolerance
+      max_steps: request.max_steps ?? null, // steps of the planned route this walk may take; null walks it all
+      candidates_ref: request.candidates_ref,
+      candidates_count: request.candidates_count,
+      candidates_kind: request.candidates_kind,
+      attempt: request.attempt,
+      invocation_id: request.invocationId,
+    }
+  };
+
+  watcher.summary('locomotion_dispatcher',
+    `🚪 ${request.verb} → ${goalText}, entering ladder at '${nextRung}' (attempt ${request.attempt}, invocation #${request.invocationId}).`
+  );
+
+  signalBus.route(payload.to, payload);
+}
+
+// ---------------------------------------------------------------------------
+// SECTION 6: The exposed API
+// ---------------------------------------------------------------------------
+// Each call returns a promise resolving only on a success verdict from locomotion_judge; on give-up or emergency it never resolves (Law 15).
+// ---------------------------------------------------------------------------
+
+// ── THE WALK LEDGER: ONE LINE PER WALK, UNDER A TAG THAT REACHES DISK ──
+// A walk is one of two legs. `travel` is getting to the work or away from it: to the site, to a chest or
+// a table, back home. `work` is moving about inside the work once it has begun, and a caller says so with
+// `leg: 'work'` on its goal. Only travel is counted as walking against the job's time.
+const LEGS = Object.freeze(['travel', 'work']);
+function _legOf(goal) {
+  const leg = (goal && goal.leg) || 'travel';
+  if (!LEGS.includes(leg)) {
+    throw new Error(`[locomotion_dispatcher] CODING VIOLATION (Law 13): a walk was asked with leg '${leg}'; the legs are ${LEGS.join(' and ')}.`);
+  }
+  return leg;
+}
+// Every walk is charged to the job the body holds (bot_minutes' open span: its job token, or idle/startup)
+// and to its purpose (the station it walks to, or `move`), so a lens can split commuting from working and
+// say where the commute went. `walk_ledger` is not a quiet tag, unlike this file's own.
+function _walkCategory() {
+  const span = require('@kernel/bot_minutes').snapshot().open_span;
+  if (!span) return 'none';
+  return span.kind === 'working' ? span.label : `${span.kind}:${span.label || '-'}`;
+}
+// THIS BODY'S OWN WALKING PACE, measured off the walks it has finished: every arrived walk of PACE_MIN_WALK
+// blocks or more adds its flat distance and its time. walkPace() → seconds per block, or null until
+// PACE_MIN_TOTAL blocks have been measured.
+const PACE_MIN_WALK = 8;
+const PACE_MIN_TOTAL = 32;
+const _pace = { blocks: 0, ms: 0 };
+function walkPace() {
+  return _pace.blocks >= PACE_MIN_TOTAL ? (_pace.ms / 1000) / _pace.blocks : null;
+}
+function _ledgerWalk(p, outcome, endPosition) {
+  if (outcome === 'arrived' && p.fromPos && endPosition) {
+    const blocks = Math.hypot(endPosition.x - p.fromPos.x, endPosition.z - p.fromPos.z);
+    if (blocks >= PACE_MIN_WALK) { _pace.blocks += blocks; _pace.ms += Date.now() - p.startedAt; }
+  }
+  const held = ((Date.now() - p.startedAt) / 1000).toFixed(1);
+  if (p.leg === 'travel') require('@kernel/bot_minutes').walked(Date.now() - p.startedAt, p.category);
+  const at = endPosition ? `(${endPosition.x},${endPosition.y},${endPosition.z})` : 'unknown';
+  watcher.summary('walk_ledger',
+    `walk verb=${p.verb} category=${p.category} purpose=${p.purpose} leg=${p.leg} held=${held}s outcome=${outcome} from=${p.from} to=${at}`);
+}
+
+// invoke: validates the goal, claims the single pending slot, and dispatches attempt 1 (retries
+// are rebuilt from the judge's verdict echo, never from memory here).
+function invoke(verb, goal) {
+  const normalized = normalizeGoal(verb, goal); // throws before any state changes
+  if (pending) {
+    // previous invocation abandoned (give-up/emergency); log and replace.
+    watcher.warn('locomotion_dispatcher',
+      `⚠️ Invocation #${pending.invocationId} (${pending.verb}) was still pending — treating as abandoned and replacing.`
+    );
+    _ledgerWalk(pending, 'abandoned', null);
+    replaced.set(pending.invocationId, pending);
+    if (replaced.size > REPLACED_MAX) {
+      const [oldestId, oldest] = replaced.entries().next().value;
+      replaced.delete(oldestId);
+      watcher.warn('locomotion_dispatcher', `⚠️ Replaced invocation #${oldestId} (${oldest.verb}) never returned a verdict; settled as replaced, ${REPLACED_MAX} newer replacements held.`);
+      oldest.resolve({ arrived: false, verb: oldest.verb, position: null, attempts: 0, reason: 'replaced' });
+    }
+  }
+  invocationCounter++;
+  const start = global.bot?.entity?.position?.floored?.();
+  return new Promise((resolve) => {
+    pending = {
+      invocationId: invocationCounter,
+      verb,
+      resolve,
+      startedAt: Date.now(),
+      category: _walkCategory(),
+      purpose: (goal && typeof goal.purpose === 'string' && goal.purpose) || 'move',
+      leg: _legOf(goal),
+      from: start ? `(${start.x},${start.y},${start.z})` : 'unknown',
+      fromPos: start || null,
+    };
+    dispatchChain({
+      verb,
+      coordinate: normalized.coordinate,
+      require_los: normalized.require_los,
+      required_side: normalized.required_side,
+      min_y: normalized.min_y,
+      max_y: normalized.max_y,
+      walk_only: normalized.walk_only,
+      leading: normalized.leading,
+      spare_builds: normalized.spare_builds,
+      avoid_body: normalized.avoid_body,
+      exact: normalized.exact,
+      max_steps: normalized.max_steps,
+      candidates_ref: normalized.candidates_ref,
+      candidates_count: normalized.candidates_count,
+      candidates_kind: normalized.candidates_kind,
+      attempt: 1,
+      invocationId: invocationCounter
+    });
+  });
+}
+
+// goTo: move toward a goal, succeeding at the closest reachable position if unreachable. bare {x,y,z}
+// stands ON the cell (digs through); { require_los: true } is for placing/digging. To USE a station, call goToStationStance below.
+//
+// A walk into or out of a blueprint's lane (blueprint_survey.getWorldLanes) is made in legs: out by the
+// lane's exit, in by its entry, then the goal itself. Each leg is its own invocation, ledgered under
+// `lane:exit` / `lane:entry`. A leg that does not arrive ends the walk with arrived=false and names the leg.
+async function goTo(goal) {
+  const first = await _goTo(goal);
+  if (first.arrived || first.step_budget_spent || !validCoordinate(goal) || goal.purpose === RETRACE_PURPOSE) {
+    if (first.arrived || first.step_budget_spent) { _lastFailedGoal = null; _retracedGoal = null; }
+    return first;
+  }
+  // A walk failed. The first failure to a goal goes back to the caller, which picks another way; a second one in a row to
+  // the same goal is the walk the loop judges stop the run on, so the body retraces its trail first, once per goal until
+  // a walk succeeds again: a goal its trail did not reach goes on to the judges.
+  const key = `${Math.floor(goal.x)},${Math.floor(goal.y)},${Math.floor(goal.z)}`;
+  if (_lastFailedGoal !== key) { _lastFailedGoal = key; return first; }
+  if (_retracedGoal === key) return first;
+  _retracedGoal = key;
+  return retrace(goal, first);
+}
+
+// ── SAFETY: A BODY THAT CANNOT FIND ITS WAY WALKS BACK THE WAY IT CAME ─────────────────────────────────────────
+// THE TRAIL: every place a walk ended at, TRAIL_SPACING apart, the newest TRAIL_MAX of them. The body walked from each to
+// the next, so the way back between them is ground it has stood on.
+// THE ESCALATION (goTo above), before a repeated failure reaches the loop judges: the body walks back along its trail, crumb
+// by crumb from the newest, and from each crumb it reaches asks for the goal again, which is a new search from new ground.
+// It ends at the goal, at a crumb it cannot reach, or after RETRACE_LEGS crumbs; then the caller has the walk's answer.
+// Each crumb reached is a successful walk, so the identical-goal guard (locomotion_judge) counts afresh from there.
+const TRAIL_SPACING = 6;
+const TRAIL_MAX = 64;
+const RETRACE_LEGS = 8;
+const RETRACE_PURPOSE = 'retrace';
+const _trail = [];
+let _lastFailedGoal = null;
+let _retracedGoal = null;
+function _noteTrail(end) {
+  if (!end) return;
+  const last = _trail[_trail.length - 1];
+  if (last && Math.hypot(end.x - last.x, end.y - last.y, end.z - last.z) < TRAIL_SPACING) return;
+  _trail.push({ x: end.x, y: end.y, z: end.z });
+  if (_trail.length > TRAIL_MAX) _trail.shift();
+}
+async function retrace(goal, failed) {
+  const here = () => global.bot?.entity?.position?.floored?.();
+  const to = `(${Math.floor(goal.x)},${Math.floor(goal.y)},${Math.floor(goal.z)})`;
+  let legs = 0;
+  for (let i = _trail.length - 1; i >= 0 && legs < RETRACE_LEGS; i--) {
+    const crumb = _trail[i];
+    const p = here();
+    if (p && Math.hypot(crumb.x - p.x, crumb.y - p.y, crumb.z - p.z) < TRAIL_SPACING) continue;
+    legs++;
+    watcher.warn('locomotion_dispatcher', `↩️ retrace ${legs}/${RETRACE_LEGS}: the walk to ${to} failed twice in a row; walking back along the trail to (${crumb.x},${crumb.y},${crumb.z}) and asking again from there.`);
+    const back = await _goTo({ x: crumb.x, y: crumb.y, z: crumb.z, purpose: RETRACE_PURPOSE, leg: goal.leg || 'travel' });
+    if (!back.arrived) {
+      watcher.warn('locomotion_dispatcher', `↩️ retrace ended: the trail's crumb (${crumb.x},${crumb.y},${crumb.z}) was not reached (${back.reason || 'no reason given'}); the walk to ${to} has failed.`);
+      return failed;
+    }
+    const again = await _goTo(goal);
+    if (again.arrived || again.step_budget_spent) {
+      _lastFailedGoal = null;
+      _retracedGoal = null;
+      watcher.summary('locomotion_dispatcher', `↩️ retrace found the way: ${to} reached after walking back ${legs} crumb(s).`);
+      return again;
+    }
+    failed = again;
+  }
+  watcher.warn('locomotion_dispatcher', `↩️ retrace ended: ${legs} crumb(s) walked back and ${to} still has no way; the walk has failed.`);
+  return failed;
+}
+
+async function _goTo(goal) {
+  const feet = global.bot?.entity?.position?.floored?.();
+  if (feet) {
+    const survey = require('@perception/blueprint_survey');
+    const to = validCoordinate(goal) ? { x: Math.floor(goal.x), y: Math.floor(goal.y), z: Math.floor(goal.z) } : null;
+    for (const leg of survey.laneLegs(survey.getWorldLanes(), feet, to)) {
+      const stand = standOn(leg.anchor, { purpose: `lane:${leg.point}` });
+      const now = global.bot.entity.position.floored();
+      if (now.x === stand.x && now.y === stand.y && now.z === stand.z) continue;   // already standing in the mouth
+      watcher.summary('locomotion_dispatcher',
+        `🚪 ${leg.blueprint} lane: walking by its ${leg.point} (${stand.x},${stand.y},${stand.z}) first.`);
+      const via = await invoke('goTo', stand);
+      if (!via.arrived) {
+        watcher.warn('locomotion_dispatcher',
+          `🚪 ${leg.blueprint} lane ${leg.point} (${stand.x},${stand.y},${stand.z}) was not reached (${via.reason || 'no reason given'}) — the walk ends here; the caller decides.`);
+        return { ...via, reason: `lane_${leg.point}_unreached:${via.reason || 'unknown'}` };
+      }
+    }
+  }
+  return invoke('goTo', goal);
+}
+
+// standOn: the goal that stands a body ON an anchor block — feet cell anchor + (0,1,0), the one named
+// home for that +1 conversion. Defaults exact:true (pass { exact:false } for a tolerant park).
+function standOn(anchor, opts = {}) {
+  return { x: anchor.x, y: anchor.y + 1, z: anchor.z, exact: true, ...opts };
+}
+
+// goToStand: stand ON an anchor block.
+function goToStand(anchor, opts = {}) {
+  return goTo(standOn(anchor, opts));
+}
+
+// reposition: move away from a position to a valid placement vantage — the nearest position at
+// least MIN_PLACEMENT_DIST (1.5) away with line of sight to the target, honoring required_side.
+async function reposition(awayFrom, opts = {}) {
+  const bot = global.bot;
+  if (!bot?.entity?.position) {
+    throw new Error('[locomotion_dispatcher] CODING VIOLATION: reposition called with no bot loaded.');
+  }
+
+  const Vec3 = require('vec3');
+  const { computeAStar } = require('@utils/pathfinding_utils');
+
+  const ox = Math.floor(awayFrom.x);
+  const oy = Math.floor(awayFrom.y);
+  const oz = Math.floor(awayFrom.z);
+  const side = opts.required_side || null;
+
+  const botFeet = bot.entity.position.floored();
+  const botFloor = new Vec3(botFeet.x, botFeet.y - 1, botFeet.z);
+
+  // Same LOS goal type goTo uses for interaction targets: stops at the cheapest node in
+  // [MIN_PLACEMENT_DIST, BLOCK_REACH] with line of sight, refining toward a closer position.
+  const goal = { type: 'los', targetPos: { x: ox, y: oy, z: oz }, required_side: side };
+  if (opts.min_y != null) goal.min_y = opts.min_y;
+  const result = await computeAStar(bot, botFloor, goal, { maxNodes: 500, owner: 'reposition' }); // 500: an economic bound, not a runaway guard
+
+  if (!result) {
+    watcher.summary('locomotion_dispatcher',
+      `🔄 reposition: no LOS vantage from (${ox},${oy},${oz})${side ? ` [${side} side]` : ''}`);
+    return { arrived: false, verb: 'reposition', reason: 'no_los_vantage' };
+  }
+
+  // An interrupted search has not proved a placement vantage, even when its best endpoint is the start.
+  if (result.partial) {
+    return { arrived: false, verb: 'reposition', reason: result.resourceLimited ? 'memory_budget' : 'incomplete_los_search' };
+  }
+  if (!result.path || result.path.length === 0) { // empty path: already at a valid LOS position
+    watcher.summary('locomotion_dispatcher',
+      `🔄 reposition: already at valid LOS position for (${ox},${oy},${oz})${side ? ` [${side} side]` : ''}`);
+    return { arrived: true, verb: 'reposition', position: botFeet };
+  }
+
+  const targetFloor = result.target || result.path[result.path.length - 1].pos;
+  const targetFeet = { x: targetFloor.x, y: targetFloor.y + 1, z: targetFloor.z };
+
+  watcher.summary('locomotion_dispatcher',
+    `🔄 reposition away from (${ox},${oy},${oz})${side ? ` [${side} side]` : ''} → (${targetFeet.x},${targetFeet.y},${targetFeet.z}) cost=${result.cost.toFixed(1)} [${result.nodesVisited} nodes]`);
+
+  return goTo(targetFeet);
+}
+
+// ── goToStationStance: THE ONE WAY A BOT GOES TO USE A STATION ────────────────────────────────────
+//
+// Stands the bot on a station's authored stance and faces it before returning (Law 16), resolving
+// whichever exists: 'anchor' (blueprint's owning anchor, proven to reach every voxel in its group),
+// 'recorded' (registry row's `stance` from placement), or 'in_reach' (already within BLOCK_REACH).
+// Neither source is a search — both are single authored cells, identical on every run (Law 19).
+//
+// Returns { arrived, stance, source, blueprint, roomKey, anchorIndex, reason? }: 'no_stance' — no
+// cell authored, not in reach, caller decides; 'unassigned' — blueprint owns the cell but filed it
+// outside every anchor (Law 25); 'unreachable' — a cell was authored but navigation couldn't reach it.
+async function goToStationStance(pos) {
+  const bot = global.bot;
+  if (!bot?.entity?.position) {
+    throw new Error('[locomotion_dispatcher] CODING VIOLATION: goToStationStance called with no bot loaded.');
+  }
+  const Vec3 = require('vec3'); // matches `reposition` above — this file's convention
+  const { BLOCK_REACH } = require('@utils/fragment_utils'); // the one shared interaction distance (Law 16)
+  const centre = new Vec3(pos.x + 0.5, pos.y + 0.5, pos.z + 0.5);
+  const face = async () => { await bot.lookAt(centre); };
+
+  const owner = require('@perception/blueprint_survey').resolveVoxelAnchor(pos);
+
+  if (owner && !owner.anchor) {
+    watcher.warn('locomotion_dispatcher',
+      `🚪 the ${owner.type} at (${pos.x},${pos.y},${pos.z}) belongs to blueprint "${owner.blueprint}" but to no anchor `
+      + `(unassigned voxel) — that blueprint needs the voxel filed under an anchor before a bot can use it.`);
+    return { arrived: false, stance: null, source: null, blueprint: owner.blueprint, roomKey: owner.roomKey, anchorIndex: -1, reason: 'unassigned' };
+  }
+
+  // Blueprint anchor outranks a recorded stance; the latter is consulted only when no blueprint claims the cell.
+  let stance = null, source = null, blueprint = null, roomKey = null, anchorIndex = -1;
+  if (owner) {
+    stance = owner.anchor; source = 'anchor';
+    blueprint = owner.blueprint; roomKey = owner.roomKey; anchorIndex = owner.anchorIndex;
+  } else {
+    const row = require('@perception/station_registry').stationAt(pos);
+    if (row && row.stance) { stance = row.stance; source = 'recorded'; }
+  }
+
+  if (!stance) {
+    // checked only after both authored sources come back empty (no using a station from outside the wall)
+    const d = bot.entity.position.distanceTo(centre);
+    if (d <= BLOCK_REACH) {
+      watcher.summary('locomotion_dispatcher',
+        `🚪 station at (${pos.x},${pos.y},${pos.z}) has no authored stance and is already within reach `
+        + `(${d.toFixed(1)}b) — using it where the body stands, which is the set-it-down-beside-me case.`);
+      await face();
+      return { arrived: true, stance: null, source: 'in_reach', blueprint: null, roomKey: null, anchorIndex: -1 };
+    }
+    watcher.warn('locomotion_dispatcher',
+      `🚪 the station at (${pos.x},${pos.y},${pos.z}) has no authored stance — no blueprint claims it and no `
+      + `placement stance was recorded for it — and it is ${d.toFixed(1)} blocks away, past the ${BLOCK_REACH}-block `
+      + `reach. NOTHING MOVES; the caller decides (for a crafting table, set down its own).`);
+    return { arrived: false, stance: null, source: null, blueprint: null, roomKey: null, anchorIndex: -1, reason: 'no_stance' };
+  }
+
+  watcher.summary('locomotion_dispatcher',
+    `🚪 station at (${pos.x},${pos.y},${pos.z}) → standing on its ${source} stance (${stance.x},${stance.y},${stance.z})`
+    + `${source === 'anchor' ? ` [${blueprint} anchor ${anchorIndex}]` : ''}.`);
+  // The walk is charged to the station it reaches (the walk ledger's purpose).
+  const stationType = owner?.type || require('@perception/station_registry').stationAt(pos)?.type || 'station';
+  const nav = await goToStand(stance, { purpose: `station:${stationType}` }); // owns the +1 stand conversion, exact:true by default
+  const arrived = !!(nav && nav.arrived);
+  if (arrived) await face();
+  return {
+    arrived, stance, source, blueprint, roomKey, anchorIndex,
+    reason: arrived ? undefined : (nav?.reason || 'unreachable'),
+  };
+}
+
+// ── descendColumn: sink a shaft STRAIGHT DOWN, in one XZ, and never leave it ──────────────────────
+//
+// Owns a straight descent in one column: an ordinary A* route can step aside
+// onto a diagonal, since staying in one column is a constraint a route search cannot price (Law 27).
+// Loops navigator.digDownStep and implements nothing of its own — every dig-down safety property is
+// that function's, re-sensed per step (Invariant B); this adds one constraint: no move in X or Z.
+//
+// Returns { arrived, y, dug, reason }; `arrived` is true only when the feet reach toFeetY.
+async function descendColumn({ x, z, toFeetY }) {
+  const bot = global.bot;
+  if (!bot?.entity?.position) {
+    throw new Error('[locomotion_dispatcher] CODING VIOLATION: descendColumn called with no bot loaded.');
+  }
+  if (![x, z, toFeetY].every(v => typeof v === 'number' && Number.isFinite(v))) {
+    throw new Error(`[locomotion_dispatcher] CODING VIOLATION: descendColumn needs finite {x, z, toFeetY}. Got: ${JSON.stringify({ x, z, toFeetY })}`);
+  }
+
+  const { digDownStep, digDownStall } = require('@locomotion/navigator');
+  const start = bot.entity.position.floored();
+
+  if (start.x !== x || start.z !== z) { // body must already be on the scanned column (Law 25)
+    watcher.warn('locomotion_dispatcher',
+      `⛏ descendColumn refused: body at (${start.x},${start.z}) is not on column (${x},${z}). The caller must stand it on the column first.`);
+    return { arrived: false, y: start.y, dug: 0, reason: 'not_on_column' };
+  }
+
+  const { microCenter } = require('@utils/movement/motion_primitives'); // centre before the first cut: an overhanging hitbox can hold the body up; non-fatal if it fails
+  if (!await microCenter(bot, { eps: 0.06 })) {
+    watcher.warn('locomotion_dispatcher',
+      `⛏ descendColumn could not centre on column (${x},${z}) before opening it — descending anyway; an overhanging hitbox may be caught by a neighbour and refuse to drop.`);
+  }
+
+  const budget = Math.max(0, start.y - toFeetY) + 4; // backstop only; the stall check below ends this normally
+  let dug = 0;
+
+  for (let i = 0; i < budget; i++) {
+    const before = bot.entity.position.floored();
+    if (before.y <= toFeetY) return { arrived: true, y: before.y, dug };
+    if (before.x !== x || before.z !== z) { // drift off the column is a hard stop
+      watcher.warn('locomotion_dispatcher',
+        `⛏ descendColumn stopped: body drifted to (${before.x},${before.z}) off column (${x},${z}) after ${dug} dig(s).`);
+      return { arrived: false, y: before.y, dug, reason: 'left_column' };
+    }
+    await digDownStep(bot);
+    const after = bot.entity.position.floored();
+    if (after.y >= before.y) { // dug counts observed drops, not swings
+      // A refused step down is the descent's own gate answering; the caller is handed the reason.
+      watcher.summary('locomotion_dispatcher',
+        `⛏ descendColumn stalled at y=${after.y} (wanted ${toFeetY}) after ${dug} observed drop(s) — ${digDownStall() || 'the step gave no reason'}.`);
+      return { arrived: false, y: after.y, dug, reason: `step_refused (${digDownStall() || 'no reason given'})` };
+    }
+    dug++;
+  }
+
+  const end = bot.entity.position.floored();
+  return { arrived: end.y <= toFeetY, y: end.y, dug, reason: end.y <= toFeetY ? undefined : 'budget_exhausted' };
+}
+
+// ---------------------------------------------------------------------------
+// SECTION 7: Verdict receiver (signal bus entry point)
+// ---------------------------------------------------------------------------
+// The only legal sender is locomotion_judge — its declared termination point (Law 8):
+//   { verdict: 'success', invocation_id, attempt }
+//   { verdict: 'retry', invocation_id, attempt, verb, coordinate, candidates_ref/count/kind }
+// 'success' resolves the caller's promise with where the bot ended up; 'retry' rebuilds the
+// request from the echo and dispatches a fresh chain; 'failure' resolves with arrived=false. The
+// dispatcher executes verdicts; it never judges retry-vs-failure.
+// ---------------------------------------------------------------------------
+module.exports = {
+  receive: watcher.track('locomotion_dispatcher', async function (signalType, payload) {
+    if (signalType !== 'locomotion_dispatcher') return; // ignore foreign signals
+
+    const verdictCapsule = payload?.locomotion_judge;
+    if (!verdictCapsule || typeof verdictCapsule !== 'object' || !verdictCapsule.verdict) { // stray outer route (Law 13)
+      throw new Error('[locomotion_dispatcher] CODING VIOLATION: routed signal lacks a locomotion_judge verdict capsule. Only locomotion_judge may route here.');
+    }
+
+    // A replaced walk's own chain has ended: its caller, suspended since the replacement, gets this answer. A `retry`
+    // is not dispatched (the slot is another walk's); it ends the replaced walk unarrived.
+    const old = replaced.get(verdictCapsule.invocation_id);
+    if (old) {
+      replaced.delete(verdictCapsule.invocation_id);
+      const p = global.bot?.entity?.position?.floored?.();
+      const endPosition = p ? { x: p.x, y: p.y, z: p.z } : null;
+      const arrived = verdictCapsule.verdict === 'success' && verdictCapsule.step_budget_spent !== true;
+      watcher.summary('locomotion_dispatcher',
+        `↩️ Replaced invocation #${old.invocationId} (${old.verb}) returned its own verdict '${verdictCapsule.verdict}' — settled for its caller as replaced, arrived=${arrived}.`);
+      old.resolve({ arrived, verb: old.verb, position: endPosition, attempts: verdictCapsule.attempt, reason: 'replaced' });
+      return;
+    }
+    if (!pending || verdictCapsule.invocation_id !== pending.invocationId) { // stale verdict — legal late arrival, not a bug
+      watcher.warn('locomotion_dispatcher',
+        `⚠️ Dropping stale verdict '${verdictCapsule.verdict}' for invocation #${verdictCapsule.invocation_id} (pending: ${pending ? '#' + pending.invocationId : 'none'}).`
+      );
+      return;
+    }
+
+    if (verdictCapsule.verdict === 'success') { // the API call "returns": resolve with where the bot ended up
+      const p = global.bot?.entity?.position?.floored?.();
+      const endPosition = p ? { x: p.x, y: p.y, z: p.z } : null;
+      const elapsedSec = ((Date.now() - pending.startedAt) / 1000).toFixed(1);
+      watcher.summary('locomotion_dispatcher',
+        `✅ ${pending.verb} succeeded on attempt ${verdictCapsule.attempt} in ${elapsedSec}s — bot at ${endPosition ? `(${endPosition.x},${endPosition.y},${endPosition.z})` : 'unknown'} (invocation #${pending.invocationId}).`
+      );
+      // A walk that spent the caller's step budget succeeded at what was asked and did not arrive.
+      const budgetSpent = verdictCapsule.step_budget_spent === true;
+      _ledgerWalk(pending, budgetSpent ? 'step_budget_spent' : 'arrived', endPosition);
+      if (pending.purpose !== RETRACE_PURPOSE) _noteTrail(endPosition);
+      const resolve = pending.resolve;
+      const result = { arrived: !budgetSpent, step_budget_spent: budgetSpent, verb: pending.verb, position: endPosition, attempts: verdictCapsule.attempt, selected_target: verdictCapsule.selected_target || null }; // selected_target: which candidate the ladder reached
+      pending = null; // free the slot BEFORE resolving so the caller may immediately re-invoke
+      resolve(result);
+      return;
+    }
+
+    if (verdictCapsule.verdict === 'retry') { // fresh chain from current world state, rebuilt entirely from the verdict's echo
+      watcher.summary('locomotion_dispatcher',
+        `🔁 Retry verdict received — dispatching fresh chain, attempt ${verdictCapsule.attempt} (invocation #${pending.invocationId}).`
+      );
+      dispatchChain({
+        verb: verdictCapsule.verb,
+        coordinate: verdictCapsule.coordinate ?? null,
+        require_los: verdictCapsule.require_los ?? false,
+        required_side: verdictCapsule.required_side ?? null,
+        min_y: verdictCapsule.min_y ?? null,
+        max_y: verdictCapsule.max_y ?? null,
+        walk_only: verdictCapsule.walk_only === true,
+        leading: verdictCapsule.leading === true,
+        spare_builds: verdictCapsule.spare_builds === true,
+        avoid_body: verdictCapsule.avoid_body ?? null,
+        exact: verdictCapsule.exact ?? false,
+        max_steps: verdictCapsule.max_steps ?? null,
+        candidates_ref: verdictCapsule.candidates_ref ?? null,
+        candidates_count: verdictCapsule.candidates_count ?? 0,
+        candidates_kind: verdictCapsule.candidates_kind ?? null,
+        attempt: verdictCapsule.attempt,
+        invocationId: verdictCapsule.invocation_id
+      });
+      return;
+    }
+
+    if (verdictCapsule.verdict === 'failure') {
+      const p = global.bot?.entity?.position?.floored?.();
+      const endPosition = p ? { x: p.x, y: p.y, z: p.z } : null;
+      const elapsedSec = ((Date.now() - pending.startedAt) / 1000).toFixed(1);
+      watcher.summary('locomotion_dispatcher',
+        `❌ ${pending.verb} failed after ${elapsedSec}s — bot at ${endPosition ? `(${endPosition.x},${endPosition.y},${endPosition.z})` : 'unknown'} (invocation #${pending.invocationId}). Returning arrived=false to caller.`
+      );
+      _ledgerWalk(pending, 'failed', endPosition);
+      const resolve = pending.resolve;
+      const result = { arrived: false, verb: pending.verb, position: endPosition, attempts: verdictCapsule.attempt, reason: verdictCapsule.reason || 'give_up' };
+      pending = null;
+      resolve(result);
+      return;
+    }
+
+    // An unknown verdict value is authored wrongly in the judge (Law 13).
+    throw new Error(`[locomotion_dispatcher] CODING VIOLATION: unknown verdict '${verdictCapsule.verdict}' from locomotion_judge.`);
+  }),
+
+  // The doorway: movement APIs.
+  goTo,
+  goToStand,
+  walkPace,
+  goToStationStance,
+  reposition,
+  descendColumn,
+};

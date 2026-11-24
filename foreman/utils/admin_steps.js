@@ -1,0 +1,141 @@
+'use strict';
+// foreman/utils/admin_steps.js — THE RUN'S ADMIN, AS STEPS THE FOREMAN PROVES LIKE ANY OTHER.
+//
+// The foreman owns terminal checks, clock setup and cameras as proved startup steps.
+// Each step acts and reads its result before the next step proceeds.
+//
+//   terminalsStep()        no terminal from an earlier run is open — checked, never closed
+//   clockStep(clock)       the world's time and daylight cycle are what the run asked for
+//   camerasStep(opts)      the camera crew is up on the fleet (record: 'cameras' | 'film')
+//   stopCameras(why, log)  the camera crew is taken down, recordings finalised first
+//
+// THE CAMERAS ARE REACHED AS A PROCESS, NOT A REQUIRE. The camera stack lives in the workshop, and no bot file
+// requires the workshop (preflight's dependency pass). `record_overlay.js raise` and `stop` are run as children,
+// awaited without blocking this process's loop, exactly as a person would run them.
+
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+const consoleWindow = require('@utils/console_window');
+const { CLOCKS } = require('@utils/server_settings');
+const { guardExternal, guardExternalSync } = require('@utils/external_library_guard');
+
+const PROCESS_STARTED_AT = Date.now() - Math.round(process.uptime() * 1000);
+// A window opened this close before the foreman's own start is this run's (the launcher opens a window on the
+// foreman's console in the same breath as it starts it); anything older is a leftover from an earlier run.
+const SAME_RUN_SKEW_MS = 60000;
+
+// ── NO TERMINAL FROM AN EARLIER RUN ──────────────────────────────────────────────────────────────────
+// *"before startup it should also check but not close. just prevent another start from happening and say what
+// terminals are open that prevents another start. thats our server hang problem"*.
+function terminalsStep() {
+  let left = [];
+  return {
+    name: 'no terminal from an earlier run is open',
+    proof: async () => {
+      left = consoleWindow.openWindows().filter(e => Date.parse(e.started_at) < PROCESS_STARTED_AT - SAME_RUN_SKEW_MS);
+      return left.length
+        ? { ok: false, final: true, why: `${consoleWindow.describeWindows(left)}. Nothing was closed; close them `
+          + `(node Auren_Workshop/fleet_control.js down), then start again.` }
+        : { ok: true };
+    },
+  };
+}
+
+// ── THE CLOCK ────────────────────────────────────────────────────────────────────────────────────────
+// Set through the console and READ BACK: `advance_time` accepted and not applied would leave a run walking into
+// the night it reported it had frozen out. 'held' is not this step's — the world keeps its own time.
+function clockStep(clock) {
+  const want = CLOCKS[clock];
+  const rcon = () => require('@utils/rcon_link');
+  return {
+    name: `the clock is set (${clock})`,
+    when: () => clock !== 'held',
+    tries: 2,
+    retryAfter: 2000,
+    act: async () => {
+      await guardExternal('foreman', 'set the clock', () => rcon().once([`gamerule advance_time ${want.cycle}`, `time set ${want.time}`]));
+      return null;
+    },
+    proof: async () => {
+      const r = await guardExternal('foreman', 'read the clock back', () => rcon().once(['gamerule advance_time']));
+      const said = r.ok ? r.value[0].body : r.reason;
+      return r.ok && said.includes(want.cycle) ? { ok: true, why: want.said } : { ok: false, why: `the server says "${said}"` };
+    },
+  };
+}
+
+// ── THE CAMERAS ──────────────────────────────────────────────────────────────────────────────────────
+const OVERLAY = path.join(__dirname, '..', '..', 'Auren_Workshop', 'tools', 'record_overlay.js');
+
+// run(args) → { code, out } — a child node process, its output kept for the reason it gives. Resolves on the
+// child's EXIT: the camera windows it leaves standing inherit its output pipes, so those never close.
+// The foreman's BOT_ID is not handed down: each camera process names its own record (camera_rig → watcher_camera_rig),
+// and an inherited `foreman` would write the director's lines into the foreman's record, where no camera lens reads.
+function run(args, env = null) {
+  return new Promise(resolve => {
+    const { BOT_ID: _foremanRecord, ...inherited } = process.env;
+    const child = spawn(process.execPath, [OVERLAY, ...args], { cwd: path.join(__dirname, '..', '..'), windowsHide: true, env: { ...inherited, ...(env || {}) } });
+    let out = '';
+    child.stdout.on('data', d => { out += d.toString(); });
+    child.stderr.on('data', d => { out += d.toString(); });
+    child.on('error', e => resolve({ code: -1, out: e.message }));
+    child.on('exit', code => resolve({ code, out }));
+  });
+}
+const tail = (out) => out.trim().split('\n').slice(-4).join(' | ');
+// cause(out) → the thrown error's own line when the child died on one (a stack's last lines name only frames),
+// else the tail.
+const cause = (out) => { const e = out.split('\n').find(l => /^\s*\w*Error\b/.test(l)); return e ? e.trim() : tail(out); };
+
+// The camera rig publishes who it armed here once every client stands in the world; `free` names the seats
+// a person flies.
+const RIG_READY = path.join(__dirname, '..', '..', 'js_kernel', 'camera_rig_ready.json');
+
+// The config says 'cameras' / 'film'; the overlay's own words are 'watch' / 'record'. Translated here, once.
+// `eye` asks for the seat a person flies whatever camera_configure says; `pair` ('on' the watch pair, 'rider' its rider
+// cam alone) raises those and no seat
+// to fly, whatever camera_configure and the scout focus say; `seats` names those seats for this run in
+// place of camera_configure's list (AUREN_SEATS); `onSeats` is handed the seats the rig armed, so the foreman can put
+// the person flying one where the run is.
+function camerasStep({ record, count, fill, eye, pair = false, seats = null, onSeats }) {
+  let result = null;
+  return {
+    name: record === 'off' ? 'the cameras are up' : `the cameras are up (${record})`,
+    when: () => record !== 'off',
+    act: async () => {
+      result = await run(['raise', `--overlay=${record === 'film' ? 'record' : 'watch'}`, `--count=${count}`,
+        ...(fill ? [] : ['--fill=off']), ...(eye ? ['--architect'] : []),
+        // The watch pair alone states the whole answer: the pair up, the person's seat down.
+        ...(pair ? [`--pair=${pair === 'rider' ? 'rider' : 'on'}`, '--architect=off'] : [])], seats ? { AUREN_SEATS: seats.join(',') } : null);
+      return result.code === 0 ? null : { give: `the camera overlay did not come up: ${tail(result.out)}` };
+    },
+    proof: async () => {
+      if (!result || result.code !== 0) return { ok: false, why: 'the camera overlay did not come up' };
+      const read = guardExternalSync('foreman', 'read who the camera rig armed', () => JSON.parse(fs.readFileSync(RIG_READY, 'utf8')));
+      const seats = read.ok && Array.isArray(read.value.free) ? read.value.free : [];
+      if (eye && !seats.length) {
+        return { ok: false, why: `the run asked for a seat to fly and the rig armed none (${read.ok ? 'its ready record names no free seat' : read.reason})` };
+      }
+      // A seat the rig put at its own fixed spot is left there, never placed at the base.
+      const fixed = read.ok && Array.isArray(read.value.fixed) ? read.value.fixed : [];
+      if (onSeats) onSeats(seats.filter(s => !fixed.includes(s)));
+      return { ok: true, why: seats.length ? `cameras are up, and ${seats.join(', ')} is a seat to fly` : 'cameras are watching the fleet' };
+    },
+  };
+}
+
+async function stopCameras(why, log, deferWrap = false) {
+  const r = await run(['stop', `--why=${why}`, ...(deferWrap ? ['--defer-wrap'] : [])]);
+  log(r.code === 0 ? 'cameras: down.' : `WARNING the camera overlay did not come down cleanly: ${tail(r.out)}`);
+}
+
+// The recorder owns the copy; the foreman owns when the finished run's evidence is ready.
+async function archiveRecording(log) {
+  const r = await run(['wrap']);
+  log(r.code === 0 ? 'recording: video and complete fleet logs saved together.'
+    : `WARNING recording archive failed: ${cause(r.out)}. Preserve loose footage and fleet logs before the next start.`);
+  return r.code === 0;
+}
+
+module.exports = { terminalsStep, clockStep, camerasStep, stopCameras, archiveRecording };

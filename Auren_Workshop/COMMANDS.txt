@@ -1,0 +1,152 @@
+================================================================================
+  AUREN COMMANDS — every command this bot has, on one page
+================================================================================
+
+  Run these from the Auren_Bot folder. Everything named here ships with the
+  bot, so every line on this page works in your copy.
+
+
+--------------------------------------------------------------------------------
+  FIRST — OPEN THE DOOR. NOTHING ON THIS PAGE RUNS UNTIL YOU DO.
+--------------------------------------------------------------------------------
+
+      node developer_mode.js on
+
+  One command, once per machine, and it stays. Every tool, bench, lens, camera
+  and scripted run below asks one question before it does anything: is this a
+  workbench? An ordinary copy answers no and says so in a sentence.
+
+  It is a marker file on your own disk. Nothing is unlocked, nothing phones
+  anywhere, and "node developer_mode.js off" removes it. The bots run exactly
+  the same either way -- no bot process reads this setting at all.
+
+      node developer_mode.js        what it is, and what is behind it
+      node developer_mode.js off    close it again
+
+
+================================================================================
+  START A RUN
+================================================================================
+
+  1. Edit    Auren_Bot\foreman_config.js              THE RUN, as one sentence
+  2. Run     node start_auren.js
+
+  That is the whole thing. There is no second script. The foreman refuses to
+  start while a terminal from an earlier run is open, starts (or joins) the
+  world, puts it back to its clean copy on a standard start, sets the clock,
+  raises the cameras, brings in the crew, watches for errors and deaths, ends
+  it when the soak is up, stops a world it started, and says PASS or FAIL
+  (written to fleet_logs\run_outcome.json).
+
+--------------------------------------------------------------------------------
+  THE RUN — Auren_Bot\foreman_config.js (the foreman reads it; so does a stranger's)
+--------------------------------------------------------------------------------
+    where      local | remote           the foreman starts your server / joins one
+    start      standard | continue      bots know nothing + clean world / carry on
+    soak       minutes                  how long once the crew works (0 = until stopped)
+    difficulty peaceful | normal | hard night gate, wheat field, spawn proofing on normal/hard
+    build      empty | a large BUILDS   a large build apart from the base (refused until two plans run)
+    clock      dawn | day | held        sunrise / pinned midday / leave it
+    record     off | cameras | film     cameras to watch; film needs a recorder
+    watch      true | false             end the run the moment something errors
+    wake       error, death             what is allowed to wake the watch
+
+  A standard start puts a local world back to
+      <server folder>\world_snapshots\<world>\<world>_fresh_start
+  when that copy exists. Make one with world_rollback.ps1 (SNAPSHOTS, below).
+
+--------------------------------------------------------------------------------
+  THE INSPECTION RUN — look over what the last run built
+--------------------------------------------------------------------------------
+  node start_auren.js inspect
+
+  The world comes up as the last run left it. No bot is raised, nothing is put
+  back or emptied. Your flying camera (Cam_Architect) opens and is put at the
+  base: the headframe. Midday is pinned.
+  It stays up until you end it (END A RUN, below).
+
+
+
+================================================================================
+  END A RUN
+================================================================================
+
+  node Auren_Workshop/fleet_control.js down             # EVERYTHING — recording, cameras, world
+  node Auren_Workshop/fleet_control.js takeover         # kill switch
+
+  down stops the recording if one is running, wraps the take, closes the cameras
+  and takes the world down. Nothing else to remember. If no recording was on it
+  says so and moves on.
+
+
+================================================================================
+  WHILE A RUN IS UP
+================================================================================
+
+  node Auren_Workshop/fleet_control.js status
+  node Auren_Workshop/fleet_control.js verb shutdown   # the foreman ends its run: bots home, world saved
+  node Auren_Workshop/fleet_control.js memory-wipe
+  node Auren_Workshop/fleet_control.js verb respawn
+
+
+================================================================================
+  FILMING
+================================================================================
+
+  node Auren_Workshop/tools/record_overlay.js status
+
+  Your own flying camera:   architect.enable: true
+  Your playing seat:        host.playerName, host.micDevice
+  Both live in:             Auren_Workshop\camera\camera_configure.js
+
+  Never minimize a camera window.
+
+
+================================================================================
+  EDITING A TAKE
+================================================================================
+
+  Filming is above and it ships. EDITING is a separate tool that does not.
+
+  A take is a self-describing folder — captures, traces, take.json, clips/ —
+  so cut it with whatever editor you already use. Nothing about the footage
+  needs a particular one to be readable.
+
+  Where a take lands:   footage\<date_time>\
+
+
+================================================================================
+  THE LOCAL WORLD
+================================================================================
+
+  node start_auren.js --start continue --test world   # world + foreman, no bots
+  node Auren_Workshop/fleet_control.js down                             # ...and everything off
+
+  Join at localhost, Java Edition 26.1.
+
+--------------------------------------------------------------------------------
+  SNAPSHOTS  (the engine is told which server folder with -Root)
+--------------------------------------------------------------------------------
+  .\Auren_Workshop\scripts\world_rollback.ps1 -Root <server folder> -Action list    -World 'sub_agent_01'
+  .\Auren_Workshop\scripts\world_rollback.ps1 -Root <server folder> -Action snapshot -World 'sub_agent_01' -Name <name>
+  .\Auren_Workshop\scripts\world_rollback.ps1 -Root <server folder> -Action restore  -World 'sub_agent_01' -Name <name> -Force
+
+
+================================================================================
+  ODDS AND ENDS
+================================================================================
+
+  node Auren_Workshop/tools/seed_scanner.js scan --tries=14
+  node Auren_Workshop/tools/preflight.js
+
+
+================================================================================
+  ASK INSTEAD OF READING
+================================================================================
+
+  Reading a run          monitoring\LENSES.md
+  Runs and the fleet     Auren_Workshop\fleet_runbook.md
+  Filming                Auren_Workshop\camera_runbook.md
+  Every tool, and why    Auren_Workshop\tools\README.md
+  Where your server is   foreman_config.js
+  The laws               Auren_Structural_Laws.md

@@ -1,0 +1,534 @@
+'use strict';
+// foreman/utils/startup_steps.js — THE FOREMAN'S OWN STARTUP AFTER THE WORLD IS UP, AS PROVED STEPS.
+//
+//   foremanSteps(ctx) → the list foreman_steps.runSteps walks, one act-then-proof at a time
+//     ctx: { getBot, BODY, connectBody, door, hub, startSoak, shutdown } — handed in by foreman.js, which owns them
+//
+
+const { FOREMAN_NAME, SEA_LEVEL, CREW } = require('@thinking/architect_config');
+const plan = require('../foreman_plan');
+const { log, alarm } = require('./say');
+const { getCrew, existingSite } = require('./get_crew');
+const adminSteps = require('./admin_steps');
+const runWatch = require('./run_watch');
+const runAnnouncer = require('./run_announcer');
+// The crew the run page sizes; raising, cameras and the startup proof read this same answer (Law 16).
+const CREW_COUNT = require('../../foreman_config').count;
+const { guardExternal } = require('@utils/external_library_guard');
+const { CLOCKS } = require('@utils/server_settings');
+const siteGeometry = require('@utils/site_geometry');
+const { makeExecutionPacer } = require('@utils/execution_yield');   // Startup shares the runtime's computation budget.
+const { spawnProtectionBox } = require('@perception/spawn_protection');
+const { getBiomeName } = require('@perception/biome_scanner');
+const { makeVoxelReader } = require('@utils/voxel_reader');
+const { landingSpotTest, landingFloor, viewClearOfSpawn } = require('@utils/landing_spot');
+const { loadedAreaSettled } = require('@utils/loaded_area');
+const { teleportTo } = require('@kernel/body_recovery');
+const observer = require('./observer');
+const keeper = require('../integrity_keeper');
+
+// ── THE FOREMAN'S STARTUP, AS PROVED STEPS ────────────────────────────────────
+// Each step acts, then proves itself before the next one runs; a step that cannot be proved stops the run
+// with its own sentence. After the world (foreman_world.bringUp, its own steps) come the body and the
+// crew, each sensed, acted on and proved from the world by foreman_steps.runSteps. Which steps a run has
+// is read off foreman_config's sentence:
+//   every run            the body joins · the body is a spectator
+//   every crew run       the world spawn is known · a standing spot is found · the
+//                        body stands on it · the ground there has arrived · the base is sited and in memory · the
+//                        crew is working
+//   landing: 'random'    after the standing spot is found: a random landing that holds the base is found, and
+//                        the steps after it prove that landing in place of the usual spot
+//   a continued run      the world spawn is known · the base is in memory · the crew is working, each body
+//                        where the last run left it
+//   then                 the soak is running (its end is the one shutdown road)
+// The spot search is the landing rule (`landing_spot`): the body is sent one whole loaded area beyond the
+// protected square (landingFloor) and the ground is read there, never round world spawn, so no ground the
+// foreman reads or sites on holds a protected block.
+const BODY_JOIN_LIMIT_MS = 120000;
+const SPAWN_LATCH_WAIT_MS = 30000;
+// HOW LONG THE CREW IS HELD FOR THE OBSERVER'S CAMERA to reach the world — a cold Minecraft client's JVM
+// start, asset load, resource pack and login. A CEILING and never a requirement: the step's `onTimeout`
+// proves anyway and says the camera was not there.
+const OBSERVER_WAIT_MS = 120000;
+// A held crew's release: each body is given ceiling HELD_RELEASE_CEILING_MS to make its first move before the
+// next is started, and the whole crew HELD_GO_WAIT_MS after the last release to show it moved.
+const HELD_RELEASE_CEILING_MS = 45000;
+const HELD_RELEASE_GAP_MS = 3000;          // the least time between two releases, however fast the first moved
+const HELD_GO_WAIT_MS = 120000;
+const CREW_RAISE_TRIES = 3;
+const CREW_RAISE_RETRY_MS = 15000;
+const GROUND_ARRIVED_SHARE = 0.95;   // a view disc this full is ground enough to survey; the edge of a map never fills
+
+// WAITS AS LONG AS THE GROUND IS STILL ARRIVING. A slow machine generating a fresh world streams the disc
+// slowly, so each window is compared with the last: the step fails only on a window that brought NO new
+// chunks (the ground has stopped arriving), and otherwise keeps going up to GROUND_WINDOWS windows.
+const GROUND_WINDOWS = 8;
+function groundStep(name, getBot) {
+  const got = {};
+  return {
+    name,
+    tries: GROUND_WINDOWS,
+    act: async () => {
+      const before = got.s ? got.s.missing : Infinity;
+      got.s = await loadedAreaSettled(getBot());
+      if (got.s.missing > 0 && got.s.missing >= before) {
+        return { give: `no new chunks arrived in the last ${got.s.secs}s window — ${got.s.missing} of ${got.s.disc} still missing` };
+      }
+      return null;
+    },
+    proof: async () => {
+      const s = got.s;
+      const share = (s.disc - s.missing) / s.disc;
+      return share >= GROUND_ARRIVED_SHARE
+        ? { ok: true, why: `${s.disc - s.missing} of ${s.disc} chunks after ${s.secs}s` }
+        : { ok: false, why: `${s.missing} of ${s.disc} chunks still missing after ${s.secs}s` };
+    },
+  };
+}
+
+// ── A RANDOM LANDING (foreman_config `landing: 'random'`) ─────────────────────────────────────────────
+// A loaded area is the square one body has loaded round itself, two view-distances wide. The landing is rolled between LANDING_MIN_AREAS and LANDING_MAX_AREAS of them
+// from the usual spot, so the new base shares no ground with the usual one. LANDING_ROLLS bounds the
+// re-rolls (Law 27: the bound on repeated attempts): the whole base is sited in one piece, and three loaded areas that
+// cannot hold it say the siting rules ask too much, so the run stops there with every landing's refusal (Law 13) for
+// the rules to be tuned rather than rolling on; LANDING_SPOT_REACH is how far from the rolled point a
+// standing spot is looked for, half a view radius, so a roll onto open sea is refused in one short sweep.
+const LANDING_MIN_AREAS = 2;
+const LANDING_MAX_AREAS = 4;
+const LANDING_ROLLS = 3;
+const CHUNK = 16;
+// THE USUAL LANDING'S BEARINGS from world spawn, tried in this order (Law 27: bounded by the list): east first, so a
+// seed lands the same way every run and a fixed camera seat saved for its base stays good. A bearing whose loaded
+// area holds no standing spot is said, and the next is tried.
+const USUAL_BEARINGS = [{ name: 'east', dx: 1, dz: 0 }, { name: 'south', dx: 0, dz: 1 }, { name: 'west', dx: -1, dz: 0 }, { name: 'north', dx: 0, dz: -1 }];
+
+// groundArrived(bot) → { ok, why } — the ground step's rule, run to its end inside one act: windows are
+// taken while each brings new chunks, and the share that arrived is judged.
+async function groundArrived(bot) {
+  let s = null;
+  for (let w = 0, before = Infinity; w < GROUND_WINDOWS; w++) {
+    s = await loadedAreaSettled(bot);
+    if (s.missing === 0 || s.missing >= before) break;
+    before = s.missing;
+  }
+  const share = (s.disc - s.missing) / s.disc;
+  return share >= GROUND_ARRIVED_SHARE ? { ok: true, why: `${s.disc - s.missing} of ${s.disc} chunks` }
+    : { ok: false, why: `the ground stopped arriving with ${s.missing} of ${s.disc} chunks missing` };
+}
+
+function foremanSteps({ getBot, BODY, connectBody, door, hub, startSoak, shutdown }) {
+  const at = {};
+  // The steps that put the foreman's body on new ground and survey a base from it. A continued run has its
+  // base in memory and its crew standing where the last run ended, so it searches for nothing and moves nobody.
+  const onNewGround = () => !plan.continues();
+  const randomLanding = () => onNewGround() && plan.landsAtRandom();
+  const rolls = [];   // every landing rolled this run: { n, x, z, out, refused } — the last one is the landing kept
+  let lastTrouble = null;   // the last crew raise's refusal: { code, why }, or null
+  const raise = async (opts) => {
+    const r = await getCrew(opts);
+    lastTrouble = r.ok ? null : r;
+    return r;
+  };
+  const crewStanding = async () => {
+    const state = await door.query();
+    return state.ok ? state.bots : [];
+  };
+  return [
+    {
+      name: 'the body is in the world',
+      holds: async () => BODY.present,
+      act: async () => { connectBody(); return null; },
+      within: BODY_JOIN_LIMIT_MS,
+      every: 1000,
+      proof: async () => (BODY.present ? { ok: true, why: `at ${getBot().entity.position.floored()}` }
+        : { ok: false, why: `${FOREMAN_NAME} did not join within ${BODY_JOIN_LIMIT_MS / 1000}s${BODY.lastKick ? ` (kicked: ${BODY.lastKick})` : ''}` }),
+    },
+    {
+      name: 'the body is a spectator',
+      tries: 2,
+      retryAfter: 2000,
+      act: async () => {
+        await guardExternal('foreman', 'set the body to spectator', () => require('@utils/rcon_link').once([`gamemode spectator ${FOREMAN_NAME}`]));
+        return null;
+      },
+      proof: async () => {
+        const r = await guardExternal('foreman', 'read the body\'s game mode', () =>
+          require('@utils/rcon_link').once([`data get entity ${FOREMAN_NAME} playerGameType`]));
+        const said = r.ok ? r.value[0].body : r.reason;
+        return r.ok && /\b3\b/.test(said) ? { ok: true } : { ok: false, why: `the server says "${said}"` };
+      },
+    },
+    adminSteps.clockStep(plan.CONFIG.clock),
+    // `camerasStep` carries its own `when` (`record !== 'off'`). Test-awareness is folded into the
+    // `record` value passed in here, so one condition governs whether cameras raise (Law 16). The count
+    // is `cameras` on the config page: 'crew' means one window per body, a number means that many seats.
+    // A seat-only test has the window a person flies and no bot window, whatever the page counts.
+    adminSteps.camerasStep({
+      record: plan.record(),
+      count: plan.seatOnly() ? 0
+        : plan.CONFIG.cameras === 'crew' ? CREW_COUNT
+          : ['none', 'pair', 'rider'].includes(plan.CONFIG.cameras) ? 0
+            : plan.CONFIG.cameras,
+      // A run that names its bot seats has stated the whole answer, so a later body is not given one.
+      fill: !plan.seatOnly() && plan.CONFIG.cameras === 'crew',
+      // cameras 'none' is a run a person watches: the one window is the seat they fly.
+      eye: plan.seatOnly() || plan.CONFIG.cameras === 'none',
+      // cameras 'pair' is the watch pair alone: the site cam and the rider cam, and no seat to fly; 'rider' the rider cam alone.
+      pair: plan.seatOnly() ? false : plan.CONFIG.cameras === 'pair' ? 'on' : plan.CONFIG.cameras === 'rider' ? 'rider' : false,
+      // A seat-only test raises the one watch seat, which the foreman puts at the alpha structure.
+      seats: plan.seatOnly() ? [require('./test_modes').seatOf(plan.testName())] : null,
+      // The person flying a seat this run raised is placed at the build like a named observer.
+      onSeats: (seats) => observer.seatsRaised(seats),
+    }),
+    {
+      name: 'the world spawn is known',
+      // Runs every time, not only for a self-raised crew: the spawn is published on the door (`run.spawn`)
+      // for a world-judging bench (world_forge) to read.
+      within: SPAWN_LATCH_WAIT_MS,
+      every: 500,
+      proof: async () => {
+        at.box = spawnProtectionBox(getBot());
+        if (at.box && getBot().spawnPoint) plan.note({ spawn: { x: getBot().spawnPoint.x, y: getBot().spawnPoint.y, z: getBot().spawnPoint.z } });
+        return at.box ? { ok: true, why: `centre (${at.box.centerX},${at.box.centerZ})` }
+          : { ok: false, why: 'no spawn position arrived, so there is no measuring a spot clear of it' };
+      },
+    },
+    {
+      // ── THE USUAL LANDING IS A WHOLE LOADED AREA OUT, AND ITS GROUND IS READ THERE ──────────────────
+      // The body logs in at world spawn (the server puts every new player there) and reads nothing round it: it is
+      // sent along each bearing in turn to a point half a view radius beyond the landing floor, the ground arrives,
+      // and the nearest standing spot to that point no nearer spawn than the floor is the landing. The proof is
+      // measured from the landing's own loaded chunks: not one of them may reach the protected square.
+      name: 'a standing spot clear of world spawn is found',
+      when: onNewGround,
+      act: async () => {
+        const bot = getBot();
+        const vd = bot.game.serverViewDistance;
+        at.vd = vd;
+        at.from = landingFloor(at.box.radius, vd);
+        const reach = (vd * CHUNK) / 2;
+        const fromSpawn = (x, z) => Math.max(Math.abs(x - at.box.centerX), Math.abs(z - at.box.centerZ));
+        const refused = [];
+        for (const b of USUAL_BEARINGS) {
+          const point = { x: at.box.centerX + b.dx * (at.from + reach), y: SEA_LEVEL, z: at.box.centerZ + b.dz * (at.from + reach) };
+          const sent = await teleportTo(bot, point, { name: FOREMAN_NAME });
+          if (!sent.moved) { refused.push(`${b.name}: the body did not get to (${point.x},${point.z}) (${sent.error})`); continue; }
+          const ground = await groundArrived(bot);
+          if (!ground.ok) { refused.push(`${b.name}: ${ground.why}`); continue; }
+          const reader = makeVoxelReader(bot);
+          const isSpot = landingSpotTest(reader, (x, y, z) => getBiomeName(bot, x, y, z), SEA_LEVEL);
+          const sweep = await siteGeometry.ringScan(reader, {
+            origin: point, step: 1, maxRadius: reach, pace: makeExecutionPacer(),
+            accept: (m) => fromSpawn(m.x, m.z) >= at.from,
+          }, isSpot);
+          if (!sweep.found) { refused.push(`${b.name}: ${siteGeometry.formatRejections(sweep.rejections)} across ${sweep.checked} cell(s)`); continue; }
+          at.cell = { x: sweep.best.x, y: sweep.best.result.spawnY, z: sweep.best.z };
+          at.biome = sweep.best.result.biome;
+          at.bearing = b.name;
+          return null;
+        }
+        return { give: `no standing spot ${at.from}+ blocks from world spawn on any bearing (an acceptable biome, a clear 3x3) — ${refused.join(' · ')}.` };
+      },
+      proof: async () => {
+        const clear = viewClearOfSpawn(at.cell, at.box, at.vd);
+        return clear >= 0 ? { ok: true, why: `(${at.cell.x},${at.cell.y},${at.cell.z}), ${at.biome}, ${at.bearing}, ${at.from}+ blocks out; its loaded area stops ${clear} blocks short of the protected square` }
+          : { ok: false, why: `the landing (${at.cell.x},${at.cell.z}) would load ${-clear} block(s) of the protected square — the landing floor is wrong` };
+      },
+    },
+    {
+      // ── THE LANDING IS ROLLED, AND A ROLL THE GROUND REFUSES IS ROLLED AGAIN ────────────────────────
+      // One try is one landing taken to its end: a point is rolled from the usual spot, the body goes to
+      // it, the ground arrives, a landing spot is found by the rule the usual spot is held to, the body
+      // stands on it, and the base is sited there through the same `getCrew` the siting step below asks.
+      // A landing is kept when the fleet's memory holds the base; each refusal is said with its own cause
+      // and the next try rolls a new point. The steps after this one then prove the landing it kept.
+      name: 'a random landing that holds the base is found',
+      when: randomLanding,
+      tries: LANDING_ROLLS,
+      act: async () => {
+        const bot = getBot();
+        const area = 2 * bot.game.serverViewDistance * CHUNK;
+        const usual = at.usual || (at.usual = at.cell);
+        const near = LANDING_MIN_AREAS * area;
+        const out = near + Math.random() * (LANDING_MAX_AREAS - LANDING_MIN_AREAS) * area;
+        const bearing = Math.random() * 2 * Math.PI;
+        const point = { x: Math.round(usual.x + out * Math.sin(bearing)), y: SEA_LEVEL, z: Math.round(usual.z - out * Math.cos(bearing)) };
+        const roll = { n: rolls.length + 1, x: point.x, z: point.z, out: Math.round(out), refused: null };
+        rolls.push(roll);
+        plan.note({ landing: { usual, rolls } });
+        log(`    landing ${roll.n} of ${LANDING_ROLLS}: rolled (${point.x},${point.z}), ${roll.out} blocks from the usual spot (${usual.x},${usual.z})`);
+
+        const sent = await teleportTo(bot, point, { name: FOREMAN_NAME });
+        if (!sent.moved) { roll.refused = `the body did not get there (${sent.error})`; return null; }
+        const ground = await groundArrived(bot);
+        if (!ground.ok) { roll.refused = ground.why; return null; }
+
+        const reader = makeVoxelReader(bot);
+        const isSpot = landingSpotTest(reader, (x, y, z) => getBiomeName(bot, x, y, z), SEA_LEVEL);
+        const sweep = await siteGeometry.ringScan(reader, {
+          origin: point, step: 1, maxRadius: (bot.game.serverViewDistance * CHUNK) / 2, pace: makeExecutionPacer(),
+          accept: (m) => Math.hypot(m.x - usual.x, m.z - usual.z) >= near,
+        }, isSpot);
+        if (!sweep.found) {
+          roll.refused = `no standing spot there — ${siteGeometry.formatRejections(sweep.rejections)} across ${sweep.checked} cell(s)`;
+          return null;
+        }
+        const cell = { x: sweep.best.x, y: sweep.best.result.spawnY, z: sweep.best.z };
+        const stood = await teleportTo(bot, cell, { name: FOREMAN_NAME });
+        if (!stood.moved) { roll.refused = `the body did not reach the spot (${cell.x},${cell.y},${cell.z}) (${stood.error})`; return null; }
+        const settled = await groundArrived(bot);
+        if (!settled.ok) { roll.refused = settled.why; return null; }
+
+        const sited = await raise({ at: cell, siteOnly: true });
+        if (!sited.ok) { roll.refused = `the base could not be sited from (${cell.x},${cell.y},${cell.z}) (${sited.code}): ${sited.why}`; return null; }
+        at.cell = cell;
+        at.biome = sweep.best.result.biome;
+        return null;
+      },
+      proof: async () => {
+        const roll = rolls[rolls.length - 1];
+        if (roll.refused) {
+          return { ok: false, why: rolls.length < LANDING_ROLLS ? `landing ${roll.n} refused: ${roll.refused}`
+            : `BASE NOT SITED: all ${LANDING_ROLLS} loaded areas refused the whole base, so the siting rules ask more than this world gives — `
+              + `${rolls.map(r => `landing ${r.n} (${r.x},${r.z}): ${r.refused}`).join(' · ')}. Each landing's survey report above names its refusals.` };
+        }
+        const state = await door.query();
+        const held = state.ok ? existingSite(state.buildings, CREW) : null;
+        if (!held) { roll.refused = state.ok ? 'the siting said nothing was wrong and the fleet\'s memory holds no base' : `the fleet did not answer: ${state.error}`; return { ok: false, why: `landing ${roll.n} refused: ${roll.refused}` }; }
+        return { ok: true, why: `(${at.cell.x},${at.cell.y},${at.cell.z}), ${at.biome}, ${Math.round(Math.hypot(at.cell.x - at.usual.x, at.cell.z - at.usual.z))} blocks from the usual spot `
+          + `(${at.usual.x},${at.usual.z}), on roll ${roll.n} of ${LANDING_ROLLS}` };
+      },
+    },
+    {
+      name: 'the body stands on it',
+      when: onNewGround,
+      tries: 2,
+      retryAfter: 2000,
+      act: async () => { await teleportTo(getBot(), at.cell, { name: FOREMAN_NAME }); return null; },
+      within: 5000,
+      every: 500,
+      proof: async () => {
+        const p = getBot().entity.position;
+        const d = Math.hypot(p.x - (at.cell.x + 0.5), p.y - at.cell.y, p.z - (at.cell.z + 0.5));
+        return d <= 2 ? { ok: true, why: `${d.toFixed(1)} blocks off` } : { ok: false, why: `the body reads ${p.floored()}, ${d.toFixed(0)} blocks away` };
+      },
+    },
+    Object.assign(groundStep('the ground there has arrived', getBot), { when: onNewGround }),
+    {
+      name: 'the base is sited and in memory',
+      tries: CREW_RAISE_TRIES,
+      retryAfter: CREW_RAISE_RETRY_MS,
+      act: async () => {
+        const sited = await raise({ at: at.cell, siteOnly: true, resume: plan.continues() });
+        // Only ground that had not finished arriving is worth asking about again; every other refusal would say
+        // the same thing on the next try.
+        if (!sited.ok && sited.code !== 'world_streaming') return { give: `the base could not be sited (${sited.code}) — the lines above say why.` };
+        return null;
+      },
+      proof: async () => {
+        const state = await door.query();
+        const held = state.ok ? existingSite(state.buildings, CREW) : null;
+        return held ? { ok: true, why: held.site.map(r => r.roomKey).join(', ') }
+          : { ok: false, why: state.ok ? `no base under '${CREW}' in the fleet's memory (${lastTrouble ? lastTrouble.code : 'no refusal given'})` : `the fleet did not answer: ${state.error}` };
+      },
+    },
+    // ── ONE CHECK AT THE TOP, NOT TWENTY AT THE BOTTOM ────────────────────────
+    // Every structure this crew must raise is proved sited, and its build's plan is proved valid, in this
+    // one place before any body spawns — the last moment a refusal is still free, sitting between the
+    // siting step above and the crew-raising step below. The step before this one proves a base exists;
+    // this one proves it is the WHOLE base: `existingSite` returns whatever rows happen to carry a
+    // `transpose_origin`, so a crew whose second structure never got sited would otherwise pass that proof
+    // and fail later, one executor at a time. `STRUCTURE_PRIORITY` is the list of what this crew must
+    // raise, so it is the list this step holds the siting to.
+    {
+      name: 'every structure this crew builds is sited, and its plan is proved',
+      proof: async () => {
+        // Every STRUCTURE_PRIORITY name is one room key; the mine's is the site its shaft hangs from (SHAFT_HEAD). Read as a SET: this step asks "is every structure this crew
+        // raises actually sited", a property of the list's MEMBERS and not of its order (the order is a rank, owned
+        // by job_ranking).
+        const { SHAFT_HEAD } = require('@thinking/architect_config');
+        // The structures the crew raises (its priority less every support nothing needs: support_need), and the wheat
+        // and cane field copies too, as many as critical mass asks for (calculators/wheat_critical_mass).
+        const raised = require('@utils/calculators/support_need').structuresRaised();
+        const wanted = [...new Set([...raised, ...require('@utils/calculators/wheat_critical_mass').fieldKeysSited()])];
+        const siteOf = (s) => (s === 'shallow_shaft' ? SHAFT_HEAD : s);
+        const state = await door.query();
+        if (!state.ok) return { ok: false, why: `the fleet did not answer: ${state.error}` };
+        const sited = new Set((existingSite(state.buildings, CREW)?.site || []).map(r => r.roomKey));
+        const absent = wanted.filter((s) => !sited.has(siteOf(s)));
+        if (absent.length) {
+          const named = absent.map((s) => `"${s}" is not sited`);
+          return { ok: false, why: `${named.join('; ')}. `
+            + `This crew raises [${wanted.join(', ')}] and the fleet's memory holds [${[...sited].join(', ') || 'none'}]. `
+            + `The foreman sites every one of them BEFORE a body is spawned — no body sets its own, and no body `
+            + `should discover this twenty times over.` };
+        }
+        // THE BUILD'S PLAN IS A FILE, AND A FILE IS PROVED ONCE. `load` walks every stateful voxel through
+        // facing_aim and checks schema, dimensions, ground floor, anchors and columns, refusing a block
+        // family the fleet has never measured before any body exists to repeat that refusal.
+        // `plan.planned()`, not a fresh `require('foreman_config')`: the foreman already reads its own
+        // sentence through foreman_plan. One route to the build's name (Law 16).
+        const proved = plan.planned().map((buildName) => {
+          const p = require('@kernel/downloaded_plan_registry').load(buildName);
+          return `"${buildName}" proved — ${p.dimensions.w}×${p.dimensions.l}, ${p.columns.length} columns, ${p.anchors.length} cubes`;
+        });
+        return { ok: true, why: `${wanted.join(', ')} sited; ${proved.join('; ')}` };
+      },
+    },
+    {
+      // ── THE BODY HANGS OVER THE BASE FOR THE WHOLE RUN ──────────────────────────
+      // The integrity keeper reads the crew's plans from the chunks this body has loaded (foreman.js), so the body
+      // is centred on the alpha structure's cell, lifted clear like the camera so it is never in a bot's way. The
+      // landing spot only surveys the base; this is where the body stays. A continued run moves it too, since the
+      // server logs it in wherever the last run left it. The client's own physics would drop a spectator onto the
+      // ground under it (mineflayer simulates gravity whatever the game mode), so it is switched off first.
+      name: 'the body hangs over the base',
+      tries: 2,
+      retryAfter: 2000,
+      act: async () => {
+        const state = await door.query();
+        const held = state.ok ? existingSite(state.buildings, CREW) : null;
+        if (!held || !held.seat) return { give: 'the base has no alpha cell to hang the body over' };
+        at.over = { x: held.seat.x, y: held.seat.y + observer.LIFT, z: held.seat.z };
+        getBot().physicsEnabled = false;
+        await teleportTo(getBot(), at.over, { name: FOREMAN_NAME });
+        return null;
+      },
+      within: 5000,
+      every: 500,
+      proof: async () => {
+        const p = getBot().entity.position;
+        const d = Math.hypot(p.x - (at.over.x + 0.5), p.y - at.over.y, p.z - (at.over.z + 0.5));
+        return d <= 2 ? { ok: true, why: `over (${at.over.x},${at.over.y},${at.over.z})` } : { ok: false, why: `the body reads ${p.floored()}, ${d.toFixed(0)} blocks from the base` };
+      },
+    },
+    {
+      // ── THE INTEGRITY KEEPER IS UP BEFORE ANY BODY ──────────────────────────────
+      // A body makes no integrity decision without the keeper's verdict (keeper_verdicts), so the keeper is raised
+      // here, from the body now at its station, and proved holding every sited structure before the first body is
+      // raised. A structure it cannot hold from the station stops the run here.
+      name: 'the integrity keeper holds every structure',
+      act: async () => {
+        if (!keeper.raised()) keeper.start({ bot: getBot(), hub, log });
+        return null;
+      },
+      within: 30000,
+      every: 500,
+      proof: async () => {
+        const v = keeper.verdict('structures');
+        if (!v) return { ok: false, why: 'the keeper has posted no structures verdict yet' };
+        const rows = Object.entries(v.structures);
+        const unheld = rows.filter(([, r]) => !r.held).map(([k]) => k);
+        if (!rows.length) return { ok: false, why: 'the keeper keeps no sited structure' };
+        return unheld.length
+          ? { ok: false, why: `the keeper does not hold ${unheld.join(', ')} from its station` }
+          : { ok: true, why: `${rows.length} structure(s) held: ${rows.map(([k, r]) => `${k.split('|')[0]} ${r.all_complete ? 'built' : `${r.steps.length} step(s)`}`).join(', ')}` };
+      },
+    },
+    {
+      // ── THE CAMERA GOES TO THE ALPHA ANCHOR BEFORE THE CREW SPAWNS ────────────
+      // The seat is read from the fleet's memory, not a local variable: `existingSite(...).seat` is the
+      // same read the siting step above proves with, resolving to the ALPHA structure's transpose_origin
+      // (its own helper prefers the alpha row). One answer to "where is the base" (Law 16) — the same one
+      // `hub.alphaSpot()` gives the crew's placement cell, so the bodies and this camera arrive at one place.
+      //
+      // Holds the crew back while the camera's client reaches the world; bounded, and never fails the run
+      // — a run nobody is watching is still a run (observer.js: absent is not a failure, ever).
+      //
+      // Off unless there is somebody to place, so a downloaded bot never waits for a camera that does not
+      // exist: `when` reads `foreman_config.observer`, '' by default, and after it a seat the cameras step
+      // raised for a person to fly.
+      name: 'the camera is at the build',
+      when: () => observer.names().length > 0,
+      act: async () => {
+        const state = await door.query();
+        const held = state.ok ? existingSite(state.buildings, CREW) : null;
+        if (held && held.seat) observer.remember(held.seat);
+        return null;
+      },
+      within: OBSERVER_WAIT_MS,
+      every: 3000,
+      proof: async () => {
+        const r = await observer.atSite();
+        if (r.ok) return { ok: true, why: r.why };
+        return { ok: false, why: `${observer.names().join(', ')} not all placed yet — ${r.why}` };
+      },
+      // A ceiling, not a requirement: `onTimeout` makes this step unfailable, taking this verdict instead
+      // of the last refusal, so a camera that never logs in costs only the wait, and the crew goes up.
+      onTimeout: () => ({ ok: true, why: `${observer.names().join(', ')} did not all arrive within ${OBSERVER_WAIT_MS / 1000}s — raising the crew anyway; joining later still puts it on the build.` }),
+    },
+    {
+      name: 'the crew is working',
+      act: async () => {
+        await raise({ at: at.cell, resume: plan.continues(), held: plan.heldForGo() });
+        return null;
+      },
+      within: 10000,
+      every: 2000,
+      proof: async () => {
+        const crew = await crewStanding();
+        const size = CREW_COUNT;
+        return crew.length >= size ? { ok: true, why: crew.map(b => b.id).join(', ') }
+          : { ok: false, why: `${crew.length} of ${size} bots standing${lastTrouble ? ` (${lastTrouble.code})` : ''} — the lines above say why` };
+      },
+    },
+    {
+      // ── A HELD CREW IS RELEASED ONCE EVERY BODY STANDS ─────────────────────
+      // The whole crew is raised and placed before any of it works, so the cameras are set up while bodies
+      // arrive. The step before proved every body standing; here the clock goes back to the run's start
+      // (the hold spent some of the morning) and the bodies are released one at a time, each after the
+      // one before it has made its first move — the operator's staggered start, given by the foreman.
+      // Proved from each body's own first route search, so the soak counts from the go.
+      name: 'the crew has its go',
+      when: () => plan.heldForGo(),
+      act: async () => {
+        const want = CLOCKS[plan.CONFIG.clock];
+        if (want && !plan.continues()) await guardExternal('foreman', 'set the clock for the go', () => require('@utils/rcon_link').once([`time set ${want.time}`]));
+        for (const b of await crewStanding()) {
+          hub.startBody(b.id);
+          const t0 = Date.now();
+          for (;;) {
+            const now = await crewStanding();
+            if (now.some(x => x.id === b.id && x.first_move_at) || Date.now() - t0 >= HELD_RELEASE_CEILING_MS) break;
+            await new Promise(r => setTimeout(r, 500));
+          }
+          const spent = Date.now() - t0;
+          if (spent < HELD_RELEASE_GAP_MS) await new Promise(r => setTimeout(r, HELD_RELEASE_GAP_MS - spent));
+          log(`  released ${b.id} — moving after ${(spent / 1000).toFixed(1)}s`);
+        }
+        return null;
+      },
+      within: HELD_GO_WAIT_MS,
+      every: 3000,
+      proof: async () => {
+        const crew = await crewStanding();
+        const going = crew.filter(b => b.first_move_at);
+        return crew.length && going.length === crew.length ? { ok: true, why: `${going.length} bots started, one at a time` }
+          : { ok: false, why: `${going.length} of ${crew.length} bots started` };
+      },
+    },
+    {
+      name: 'the soak is running',
+      act: async () => {
+        startSoak();
+        runAnnouncer.start({
+          fleetState: () => hub.fleetState(),
+          getBot,
+        });
+        runWatch.start({
+          fleetState: () => hub.fleetState(), wake: plan.CONFIG.wake, watch: plan.CONFIG.watch,
+          onWake: (why) => { alarm(['THE WATCH WOKE — THE RUN IS ENDING', why]); shutdown(`the watch woke: ${why}`, 2); },
+          build: plan.endsWhenBuilt() ? plan.build() : null, real: plan.endsWhenReal(),
+          onBuilt: (who) => { runAnnouncer.now(); shutdown(`${plan.build()} stands as its plan asks${plan.endsWhenReal() ? ', every stood-in cell its real block' : ''} (read by ${who})`, 0); },
+          held: plan.endsWhenHeld(),
+          onHeld: (n) => { runAnnouncer.now(); shutdown(`the fleet holds ${n} ${plan.endsWhenHeld().item}, the ${plan.endsWhenHeld().count} the run waited for (the item book)`, 0); },
+        });
+        return null;
+      },
+      proof: async () => ({ ok: true, why: `${plan.CONFIG.soak} min`
+        + `${plan.CONFIG.watch ? `, watched for ${plan.CONFIG.wake.join(', ')}` : ', not watched'}` }),
+    },
+  ];
+}
+
+module.exports = { foremanSteps };

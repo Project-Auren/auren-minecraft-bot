@@ -1,0 +1,354 @@
+// fragment: stone_column_scanner (perception)
+// purpose: find ONE surface column the bot may dig straight down to reach an uninterrupted run of
+//          stone, and report it — or report that this sweep found none. Pure perception: it makes no
+//          decisions and routes no signals (Law 1's direct-call exception, Law 3).
+//
+// ── THE COLUMN IS THE UNIT ────────────────────────────────────────────────────────────────────────
+// The verb this feeds digs a 1-wide shaft straight down and seals it on the way back up, so the only
+// thing it can ever collect is what stands in ONE column. The column is the whole question: how much
+// stone is under this XZ, is it continuous, and is there something solid to stand on when the last
+// block of it is gone.
+//
+// Depth to stone is a preference — a deeper column costs more digging and more sealing material but
+// yields the same stone. An uninterrupted run is a gate — a gap in it is either a cave (the shaft opens
+// into a void the bot falls through, and the drops fall with it) or a pocket of something else (the run
+// does not meet the yield the caller asked for, Law 25). The two are ranked, never blended into a
+// score: depth only breaks ties among columns that already clear the run gate.
+//
+// ── THE RESTING BLOCK (Law 17) ────────────────────────────────────────────────────────────────────
+// The column is checked one block PAST the run: the cell below the last stone must be a safe solid.
+// That cell is where the bot stands when the dig finishes, so without it the final dig-down drops the
+// body into whatever is under the run. The descent authority (navigator.digDownStep) already refuses
+// that step for itself, block by block; this rule asks the same question once, in advance, so a column
+// that would strand the bot nine blocks down is never begun.
+//
+// ── STONE MEANS `stone` ───────────────────────────────────────────────────────────────────────────
+// Not the `stone` GROUP (which also carries andesite/diorite/granite). Those mine to themselves, not
+// to cobblestone, so a run counted across them yields a pile no recipe in this fleet asks for. The
+// run must be one material and that material is `stone`.
+//
+// ── A DIG MAY NOT MAKE A FLOW: THE SHAFT IS WALLED ON ALL FOUR SIDES ──────────────────────────────
+// Every cell the shaft opens must have a full solid block on each of its four cardinal neighbours, for
+// the whole depth. This guard carries the most weight: a shaft that breaches water becomes a permanent
+// flow into whatever it drains into, and the fleet cannot undo it. The same wall rule also excludes the
+// cave the run test cannot see: a column can be nine whole blocks of stone and still sit against an
+// open cavern the body falls sideways into.
+//
+// Solidity alone is not enough for a wall: sand and gravel are FULL blocks and still fail as walls,
+// because the column they belong to collapses into the shaft and whatever caps or borders that column
+// follows it in (gravity_utils.followGravityColumn is the mine's one gravel doctrine). A wall is
+// therefore solid, not fluid, and — if it is a gravity block — not a conduit.
+//
+// ── WHAT COUNTS AS THE SURFACE IS NOT THIS FILE'S TO DECIDE ───────────────────────────────────────
+// The shaft starts at the surface, and "the surface" already has one definition in this tree —
+// site_geometry.surfaceY, the test find_buildingspot sites every base against. Answering it here
+// would let the shaft and the base disagree about where the ground is (Law 16). The canopy suffix
+// rule is applied by the CALLER, as site_geometry's own header requires: a column whose topmost
+// ground is a trunk is refused, because the pillar back out would come up through the tree.
+//
+// ── RANKED NEAREST-FIRST, THEN SHALLOWEST ─────────────────────────────────────────────────────────
+// Distance is the primary key and depth only breaks its ties, because the two costs are not the same
+// kind. A deeper column costs a few more digs and a little more filler — bounded, and paid once. A
+// farther column costs a route, and a route is where this fleet actually fails: it can be blocked,
+// re-planned, or refused outright by terrain the scan never looked at. The cheap certain cost is
+// preferred over the small uncertain one. A Chebyshev ring holds 8r cells at the same distance, so
+// ties at the primary key are common and the depth key resolves them.
+//
+// A LIST, not a winner. The caller claims a column before walking to it, so it must be able to take
+// the next one when a peer already holds this one or the body cannot reach it — a single best answer
+// would make every contested column a conceded trip.
+//
+// ── UNSENSED IS NOT PERMISSION (Law 13) ───────────────────────────────────────────────────────────
+// Every read here rejects on a null block; an unread cell is never treated as open. An unloaded chunk
+// is the one state that looks identical to open air through a solidity test, so a column accepted
+// across one has been accepted on no evidence at all.
+
+'use strict';
+
+const watcher = require('@kernel/watcher');
+const blueprintSurvey = require('@perception/blueprint_survey');
+const { makeVoxelReader } = require('@utils/voxel_reader');
+const { isNotSafeSurface, getClearance, belowDepthFloor } = require('@utils/movement/terrain_predicates');
+const { STATION_TYPES } = require('@utils/fragment_utils');
+const { isFluid, isGravityBlock, followGravityColumn } = require('@utils/gravity_utils');
+const { surfaceY: groundYAt, isCanopy } = require('@utils/site_geometry');
+const { STONE_PIERCE } = require('@thinking/architect_config');
+
+const TAG = 'stone_column_scanner';
+
+// The material the run must be made of, and the only one. See the header.
+const RUN_BLOCK = 'stone';
+
+// The four faces a 1-wide shaft exposes. The vertical neighbours are the shaft itself and the way out,
+// so only the horizontals can leak into it.
+const CARDINALS = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+
+// Standing room: the body occupies two cells, so one clear block over the surface is not a place it can
+// stand — it is a place it suffocates. Asked through the fleet's own clearance predicate, so the shaft
+// and the route agree about which cells a body fits in (Law 16).
+const STAND_CLEARANCE = 2;
+
+// ── A SHAFT IS NOT SUNK BESIDE A STATION ───────────────────────────────────────
+// Every body walks to the shared crafting table and the shared chest, and the scanner ranks
+// nearest-first, so the ground around a station is the most-scanned ground in the world. A 1-wide hole
+// there is a pit the whole crew has to path around, or fall into, for the whole middle of the descent —
+// the seal only closes at the end.
+//
+// `STATION_TYPES` is the fleet's one definition of a station (Law 16): a barrel, a furnace and a
+// crafting table are the things a body WALKS TO. The blueprint exclusion below is a separate rule about
+// a separate thing (do not mine the building), and both apply.
+//
+// ASKED ONCE PER SCAN, not once per candidate: one `findBlocks` over the loaded area
+// (STONE_PIERCE.station_reach), then a distance test per column.
+const STATION_CLEARANCE = 5;
+
+// stationsNear(bot) → [{x, z}] — every station standing within reach of the columns this scan will rank.
+// Read through ring_scan, the fleet's one block search (Law 16), which yields while it reads: a raw findBlocks over
+// this reach reads every one-block section (all air, all stone) cell by cell in one blocking call, and the body stops
+// answering the server.
+//
+// The scan runs to the edge of the loaded area, so the stations are sought over all of it
+// (STONE_PIERCE.station_reach). Ids, not a name-matcher function (the same resolution
+// `surface_filter.targetIds` uses): a name predicate defeats findBlocks' palette skip and turns a
+// bounded query into a full voxel sweep.
+async function _stationsNear(bot) {
+    const names = [...STATION_TYPES].filter(name => bot.registry?.blocksByName?.[name]);
+    if (!names.length) return [];
+    const { found } = await require('@utils/ring_scan').nearestBlocks(bot,
+        { names, reach: STONE_PIERCE.station_reach, source: TAG }, 256);
+    return found.map(o => ({ x: o.position.x, z: o.position.z }));
+}
+
+// One reader per bot (the number→description table memoizes inside it), dropped with the bot.
+// Mirrors surface_filter — Law 16, one reader-lifecycle rule, not a second one invented here.
+const _readers = new WeakMap();
+function readerFor(bot) {
+    let r = _readers.get(bot);
+    if (!r) { r = makeVoxelReader(bot, { needs: ['type'] }); _readers.set(bot, r); }
+    return r;
+}
+
+// Chebyshev rings outward from the origin — nearest-first without sorting, which is what lets the
+// caller stop at the first batch that yields a fit and never look at the rest. Each cell carries its ring.
+function* _ringCells(cx, cz, minR, maxR) {
+    for (let r = minR; r <= maxR; r++) {
+        for (let dx = -r; dx <= r; dx++) {
+            for (let dz = -r; dz <= r; dz++) {
+                if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;   // perimeter only
+                yield [cx + dx, cz + dz, r];
+            }
+        }
+    }
+}
+
+// _nearestPermitted(feet, banned) → the nearest column outside the gather keep-out, or null within exit_reach.
+function _nearestPermitted(feet, banned) {
+    for (const [x, z] of _ringCells(feet.x, feet.z, 0, STONE_PIERCE.exit_reach)) {
+        if (!banned({ x, z })) return { x, z };
+    }
+    return null;
+}
+
+// A wall the shaft may be opened against: readable, solid, not a fluid, and not a gravity column that
+// would collapse and bring one in. Returns null when the wall holds, or the reason it does not.
+// Kept out of _evaluate because it is the EXPENSIVE question — four reads per level against one per
+// level for everything else — and is therefore asked last, only of columns that already passed.
+function _wallFault(bot, reader, x, y, z) {
+    for (const [dx, dz] of CARDINALS) {
+        const nx = x + dx, nz = z + dz;
+        const n = reader.blockAt(nx, y, nz);
+        if (!n) return 'wall_unloaded';
+        if (isFluid(n.name)) return 'wall_fluid';
+        if (n.boundingBox !== 'block') return 'wall_open';
+        if (isGravityBlock(n.name) && followGravityColumn(bot, nx, y, nz) === 'CONDUIT') return 'wall_conduit';
+    }
+    return null;
+}
+
+// Evaluate one column. Returns the fit, or a short reason it is not one (the reason is kept for the
+// summary line — a scan that rejects 64 columns for 64 different causes reads very differently from
+// one that rejects them all for the same cause, and that difference is the diagnosis).
+function _evaluate(bot, reader, x, z, refY, protectedKeys, stations) {
+    // FIRST, BECAUSE IT IS THE CHEAPEST GATE IN THE FUNCTION and it rejects the most-scanned ground in
+    // the world (see STATION_CLEARANCE). Horizontal distance only — a station one block up a slope is
+    // still a station a body walks to, and a shaft beside it is still a pit in the path.
+    for (const s of stations) {
+        if ((s.x - x) ** 2 + (s.z - z) ** 2 <= STATION_CLEARANCE ** 2) return { fit: null, why: 'near_station' };
+    }
+    const ground = groundYAt(reader, x, z, refY, STONE_PIERCE.scan_up, STONE_PIERCE.scan_down);
+    if (!ground) return { fit: null, why: 'no_ground' };
+    if (isCanopy(ground.name)) return { fit: null, why: 'canopy' };
+    const surfaceY = ground.y;
+
+    // The stand cell above the column, and the one above THAT: the body has to fit there before it can
+    // dig anything, and it must not be standing in a fluid when it does. A flooded stand cell passes
+    // every solidity test ever asked of it — water reports `empty` — and the first dig-down then opens
+    // the shaft underneath the water the body is swimming in.
+    const above = reader.blockAt(x, surfaceY + 1, z);
+    if (!above) return { fit: null, why: 'unloaded' };
+    if (above.boundingBox === 'block') return { fit: null, why: 'capped' };
+    if (isFluid(above.name)) return { fit: null, why: 'flooded' };
+    const surfaceBlock = reader.blockAt(x, surfaceY, z);
+    if (!surfaceBlock) return { fit: null, why: 'unloaded' };
+    if (!getClearance(bot, surfaceBlock, STAND_CLEARANCE)) return { fit: null, why: 'no_headroom' };
+
+    let overburden = 0;
+    let y = surfaceY;
+    // Walk down to the first `stone`. Anything non-solid on the way is a cave mouth or an overhang,
+    // and anything unsafe is a hazard the shaft would breach — both disqualify the column outright and
+    // are never counted as overburden.
+    while (overburden <= STONE_PIERCE.max_overburden) {
+        const b = reader.blockAt(x, y, z);
+        if (!b) return { fit: null, why: 'unloaded' };
+        if (b.name === RUN_BLOCK) break;
+        if (b.boundingBox !== 'block') return { fit: null, why: 'void_above_stone' };
+        if (isNotSafeSurface(b)) return { fit: null, why: 'hazard' };
+        // A gravity block IN the shaft is not refused for falling — the descent re-mines what drops.
+        // It is refused when its column is what a fluid rides down (the mine's gravel doctrine).
+        if (isGravityBlock(b.name) && followGravityColumn(bot, x, y, z) === 'CONDUIT') {
+            return { fit: null, why: 'gravity_conduit' };
+        }
+        overburden++;
+        y--;
+    }
+    if (overburden > STONE_PIERCE.max_overburden) return { fit: null, why: 'stone_too_deep' };
+
+    // THE GATE. Every one of the next `stone_run` cells must be `stone` — no gap, no other material.
+    const topStoneY = y;
+    for (let i = 0; i < STONE_PIERCE.stone_run; i++) {
+        const b = reader.blockAt(x, topStoneY - i, z);
+        if (!b) return { fit: null, why: 'unloaded' };
+        if (b.name !== RUN_BLOCK) return { fit: null, why: 'run_broken' };
+    }
+
+    // The resting block: one past the run, solid and safe. See the header.
+    const restingY = topStoneY - STONE_PIERCE.stone_run;
+    if (belowDepthFloor(restingY)) return { fit: null, why: 'below_depth_floor' };
+    const resting = reader.blockAt(x, restingY, z);
+    if (!resting || resting.boundingBox !== 'block') return { fit: null, why: 'no_floor' };
+    if (isNotSafeSurface(resting)) return { fit: null, why: 'floor_hazard' };
+
+    // Nothing in the shaft, nor the cell the bot stands in to start it, may belong to a blueprint.
+    // Checked over the whole column: the shaft passes through every cell between the stand and the
+    // resting block.
+    if (protectedKeys) {
+        for (let py = surfaceY + 1; py >= restingY; py--) {
+            if (protectedKeys.has(`${x},${py},${z}`)) return { fit: null, why: 'blueprint' };
+        }
+    }
+
+    // THE WALLS, LAST. Every cell the shaft opens — the surface block down to the last of the run —
+    // must be enclosed on all four sides. Asked here, after the walk down, because it costs four reads
+    // per level: a column that fails a cheaper gate never pays for this one.
+    for (let wy = surfaceY; wy > restingY; wy--) {
+        const fault = _wallFault(bot, reader, x, wy, z);
+        if (fault) return { fit: null, why: fault };
+    }
+
+    return {
+        fit: {
+            x, z,
+            surfaceY,                      // topmost ground block; the bot starts standing on it
+            overburden,                    // non-stone blocks above the run
+            standFeetY: restingY + 1,      // where the bot ends up when the run is gone
+            restingY,                      // the block it stands on there
+            depth: (surfaceY + 1) - (restingY + 1),   // blocks to dig, and blocks to seal on the way out
+            dist2: 0,                      // filled by the caller, which is what knows the origin
+        },
+        why: null,
+    };
+}
+
+// scan(bot) → { columns, summary }
+// `columns` is EMPTY when no batch produced a fit. That is a legitimate world state, not a failure —
+// the caller decides what to do about it (Law 3: this node has no opinion).
+async function scan(bot) {
+    const pace = require('@utils/execution_yield').makeExecutionPacer();
+    if (!bot?.entity?.position) {
+        throw new Error(`[${TAG}] CODING VIOLATION: scan called with no bot loaded.`);
+    }
+    const reader = readerFor(bot);
+    const feet = bot.entity.position.floored();
+
+    // Sensed, not declared: only cells the world ALREADY matches are protected, so virgin rock inside a
+    // future wall's footprint does not veto a column. See blueprint_survey.worldVoxelKeys.
+    const protectedKeys = blueprintSurvey.getAllProtectedBlocks(bot);
+    const stations = await _stationsNear(bot);
+    const banned = require('@utils/fragment_utils').gatherBanned();
+
+    // The rings start at the nearest column past the gather keep-out, so the scan's budget is spent on ground a
+    // pierce may open (architect_config.GATHER_KEEPOUT). A body already outside it scans round its own feet.
+    const origin = _nearestPermitted(feet, banned);
+    if (!origin) {
+        watcher.summary(TAG, `no column: nothing past the gather keep-out within ${STONE_PIERCE.exit_reach} blocks`);
+        return { columns: [], summary: { batches: 0, examined: 0, rejects: {} } };
+    }
+    const atFeet = origin.x === feet.x && origin.z === feet.z;
+    // ── THE WHOLE LOADED AREA ───────────────────────────────────────────────────────────
+    // The rings run outward until one holds no loaded column: the edge of what the body has loaded. No
+    // radius is set, so a body on ground with no stone under it near the base looks as far as it can see
+    // before the trip takes stone open to the sky instead (survey_executor).
+    const cells = _ringCells(origin.x, origin.z, atFeet ? STONE_PIERCE.min_radius : 0, Infinity);
+    const rejects = {};
+    let examined = 0;
+    let batches = 0;
+    let batchesWithFits = 0;
+    let ring = -1;
+    let ringLoaded = true;
+    let edge = false;
+
+    // ── A LIST OF ONE IS NOT A RANKED LIST ──────────────────────────────────────────────
+    // The caller's whole design is a claim-and-approach walk down a RANKED list — it expects
+    // alternatives, because a peer may hold the nearest column and the body should take the next one.
+    // The early return wants ENOUGH fits, not just one. `min_fits` is a floor on the list handed to the
+    // walk, not a target for the world to meet: once a fit is found the sweep reads at most `max_batches`
+    // more batches, or to the loaded edge, and returns whatever it found (Law 25: the answer is what was sensed).
+    const allFits = [];
+    while (!edge) {
+        let inBatch = 0;
+        const fits = [];
+        while (inBatch < STONE_PIERCE.scan_batch) {
+            await pace();
+            const next = cells.next();
+            if (next.done) break;
+            const [x, z, r] = next.value;
+            if (r !== ring) {
+                if (!ringLoaded) { edge = true; break; }
+                ring = r; ringLoaded = false;
+            }
+            if (!reader.blockAt(x, feet.y, z)) continue;   // past what the body has loaded
+            ringLoaded = true;
+            // No column within the gather keep-out of the base is pierced, and none spends the scan's budget.
+            if (banned({ x, z })) { rejects.base = (rejects.base || 0) + 1; continue; }
+            inBatch++; examined++;
+            const { fit, why } = _evaluate(bot, reader, x, z, feet.y, protectedKeys, stations);
+            if (!fit) { rejects[why] = (rejects[why] || 0) + 1; continue; }
+            fit.dist2 = (x - feet.x) ** 2 + (z - feet.z) ** 2;
+            fits.push(fit);
+        }
+        allFits.push(...fits);
+        batches++;
+        if (allFits.length) batchesWithFits++;
+        const ranOut = edge || inBatch < STONE_PIERCE.scan_batch;
+        if (allFits.length && (allFits.length >= STONE_PIERCE.min_fits || ranOut || batchesWithFits >= STONE_PIERCE.max_batches)) {
+            fits.length = 0;
+            fits.push(...allFits);
+            // Nearest first, shallowest breaking the tie. Squared horizontal distance — the vertical
+            // leg is the shaft the bot came to dig, so counting it would rank a column by its own
+            // depth twice.
+            fits.sort((a, b) => (a.dist2 - b.dist2) || (a.overburden - b.overburden));
+            const best = fits[0];
+            watcher.summary(TAG, `${fits.length} column(s), best @${best.x},${best.z} surface y=${best.surfaceY} `
+                + `overburden=${best.overburden} run=${STONE_PIERCE.stone_run} depth=${best.depth} `
+                + `| batch ${batches}, ${examined} columns examined`);
+            return { columns: fits, summary: { batches, examined, rejects } };
+        }
+        if (inBatch < STONE_PIERCE.scan_batch) break;   // ran out of loaded world
+    }
+
+    const worst = Object.entries(rejects).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k}:${n}`).join(' ');
+    watcher.summary(TAG, `no column in the loaded area (rings to ${ring}): ${examined} examined over ${batches} batch(es) | ${worst || 'nothing scanned'}`);
+    return { columns: [], summary: { batches, examined, rejects } };
+}
+
+module.exports = { scan };

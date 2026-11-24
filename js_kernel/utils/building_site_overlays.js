@@ -1,0 +1,322 @@
+// building_site_overlays — the two site-scan OVERLAYS find_buildingspot layers onto its base
+// surface scan, plus the two shared site-geometry primitives both the base scan and the overlays
+// use (BUFFER_BLOCKS, overlapsExisting). Extracted from find_buildingspot so the fragment holds the
+// scan PIPELINE (grid walk, candidate ranking, reporting, signal routing) and this holds the heavy,
+// world-reading geometry each overlay contributes — each independently testable against a mock bot.
+//
+// shaft overlay (payload.require_shaft):
+//   The ONLY reason the bot scans for a shallow shaft is to pick the headframe's location, so that scan
+//   folds into the site search: every surface candidate's column is checked for a safe diagonal-
+//   staircase descent AS IT IS FOUND (evaluateStaircasePrism), instead of a second full pass. It
+//   projects the REAL staircase geometry (mining_blueprinter.projectStaircase — one tiling pathway,
+//   Law 16) and hazard-checks the exact volume it will carve. A copy is "good by default" and only
+//   disqualified by a proven hazard (fluids in/adjacent, a gravity block whose column conducts fluid,
+//   unknown/unloaded blocks) — never by its contents (stone/dirt/ore are all fine to dig).
+
+'use strict';
+
+const Vec3 = require('vec3');
+// Gravity / fluid identification + the gravel-to-fluid conduit scan live in one shared module
+// (Law 16) so find_buildingspot, mining_integrity and the cell scanner all agree on what is a
+// gravity block, a fluid, and a hazardous conduit.
+const { GRAVITY_BLOCKS: SHAFT_GRAVITY_BLOCKS, FLUID_HAZARDS: SHAFT_FLUID_HAZARDS, followGravityColumn } = require('@utils/gravity_utils');
+const { projectStaircase, placePiece } = require('@perception/mining_blueprinter');
+const { transposeAttachPoints } = require('@perception/building_integrity');
+const { CLEARABLE } = require('@utils/site_geometry');
+const { guardExternalSync } = require('@utils/external_library_guard');
+
+// ── Shared site-geometry primitives (base surface scan + both overlays) ───────
+const BUFFER_BLOCKS = 2;   // extra clearance per side — building_integrity clears a 1-block perimeter, this adds navigable space beyond it
+
+function overlapsExisting(startX, endX, startZ, endZ, existingBoxes) {
+  for (const box of existingBoxes) {
+    if (startX <= box.maxX && endX >= box.minX && startZ <= box.maxZ && endZ >= box.minZ) {
+      return box.key;
+    }
+  }
+  return null;
+}
+
+// CLEARABLE is re-exported here from @utils/site_geometry so every existing consumer is unaffected:
+// this module reaches the watcher and @perception, so it is unimportable from outside the construct,
+// while the arena bench needs this exact set (Law 16).
+
+// overheadClear — walk the column above a build floor at (x,z), from groundY+1 through groundY+buildingH+1,
+// and decide whether the site carves into terrain. Every CLEARABLE block (air, trees, plants) is free — a
+// preconstruction pass removes it, at any height, no matter how many. Every OTHER block is solid terrain
+// that must be DUG; up to `maxScrape` such layers are tolerated (a small mound the build flattens), but the
+// (maxScrape+1)th proves the floor is buried in a slope/mountain and the site is rejected.
+//   maxScrape=0 (surface base, the default): ANY solid block overhead rejects — the base wants open sky
+//     above its floor. The knob stays generic for a future overlay that needs a bounded-scrape site.
+// Returns { clear:true, scraped } or { clear:false, blockName, y, scraped }.
+function overheadClear(bot, x, z, groundY, buildingH, maxScrape = 0) {
+  let scraped = 0;
+  for (let y = groundY + 1; y <= groundY + buildingH + 1; y++) {
+    const block = bot.blockAt(new Vec3(x, y, z));
+    if (!block) return { clear: false, blockName: 'unloaded_chunk', y, scraped };
+    if (CLEARABLE.has(block.name)) continue;   // air / tree / plant — cleared for free, never counts
+    scraped++;                                 // a solid terrain block that must be dug to build here
+    if (scraped > maxScrape) return { clear: false, blockName: block.name, y, scraped };
+  }
+  return { clear: true, scraped };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STAIRCASE-SAFETY OVERLAY — proves the diagonal descent is hazard-free through its required depth.
+// ─────────────────────────────────────────────────────────────────────────────
+const STAIRCASE_SAFETY = {
+  // ONE depth knob (Law 16). The descent must be hazard-free all the way to this Y; a site whose
+  // descent hits lava/water before reaching it is rejected outright — the floor must be reached, no
+  // partial descents.
+  //
+  // This is a FLOOR ON THE WHOLE MINE, not merely on the staircase: cell floors are derived from the
+  // copies this descent emits (mining_cell_graph.getDeepestSegmentMarkers), so no cell — and nothing
+  // dug — sits below the deepest copy. It is set to hold the mine clear of the DEEPSLATE BLEND BAND,
+  // which thickens from y≈8 down to y=0: deepslate is slower to mine and wants its own tooling.
+  //
+  // The descent steps 3 Y at a time and the phase depends on surface Y, so the deepest voxel lands at
+  // this Y, +1, or +2. The value is the floor the mine never passes, not the exact depth it reaches —
+  // the property worth having on a keep-out band.
+  //
+  // Set to hold the mine's deepest cell floor near iron's densest band: the deepest copy at 14 seeds
+  // the prime cell floor at 14–16 (nearest mining_cell_graph.STRADDLE_FLOOR_Y), with the cell interior
+  // running 15–19.
+  REQUIRED_DEPTH_Y: 14,
+  PRISM_MARGIN:     1,   // shell of blocks around the staircase envelope checked for fluids —
+                        // a fluid one block outside the carved volume still floods in
+  // A cave is air this many blocks or more under the ground the descent starts from. A descent meeting more
+  // than CAVE_AIR_MAX such cells is refused (evaluateStaircaseFrom), for every shaft alike.
+  CAVE_BELOW_SURFACE: 4,
+  CAVE_AIR_MAX:       0,
+};
+const CAVE_AIR = new Set(['air', 'cave_air', 'void_air']);
+// Stop scanning once this many surface-spot + safe-staircase overlaps have been found. Keeps the
+// scan from checking far more candidates than needed while still guaranteeing a non-empty result if
+// a few exist nearby.
+const SUFFICIENT_STAIRCASE_MATCHES = 5;
+
+// SHAFT_FLUID_HAZARDS and SHAFT_GRAVITY_BLOCKS are imported from @utils/gravity_utils (single source
+// of truth, Law 16). The only hazards are lava and water: a fluid is the material-based hard
+// disqualifier, and a gravity block matters ONLY when its column conducts a fluid into the descent
+// (followGravityColumn → CONDUIT) — which is itself a lava/water hazard. A gravity block that does not
+// conduct, and the descent's natural vertical steps, are not hazards.
+
+// getBiomeName — returns the stripped biome name (no 'minecraft:' prefix) at the given position, or
+// null when the read itself fails. Gates staircase candidates off the banned biomes (architect_config.settles,
+// require_shaft mode), and stamps informational biome on farmland candidates.
+//
+// An unloaded chunk is not distinguished from a loaded one reading biome id 0: prismarine-world's
+// getBiome returns 0, not null, for an unloaded chunk, so this can report biome 0's name as a sensed
+// value instead of null (Invariant B).
+//
+// getBiome is a genuine third-party boundary (chunk.getBiome / bot.world), so it keeps one — through
+// the guard, which reports the failure instead of swallowing it (Law 16).
+function getBiomeName(bot, x, y, z) {
+  const read = guardExternalSync('building_site_overlays', `getBiome at (${x},${y},${z})`, () => bot.world.getBiome(new Vec3(x, y, z)));
+  if (!read.ok || read.value == null) return null;
+  const name = bot.registry?.biomes?.[read.value]?.name || '';
+  return name.replace('minecraft:', '').toLowerCase() || null;
+}
+
+// checkCopyHazards — hazard-check ONE staircase copy against the real world. Scans every envelope
+// cell (the copy's voxels) plus a PRISM_MARGIN shell for fluids, and the envelope cells for gravity
+// blocks that conduct to fluid. The ONLY hazards are lava and water: a null/unloaded block is unsafe
+// too (Law 13 — cannot prove it clear).
+//
+// Drops/falls are NOT hazards. The diagonal descent's natural vertical steps are how the staircase is
+// built, and a plain sand/gravel block that could fall is not penalized — only a gravel/sand column
+// that actually DRAINS a fluid into the descent (followGravityColumn → CONDUIT) is rejected, and that
+// is a lava/water hazard, not a "falling block" one.
+//
+// The prism margin checks fluids outside the staircase that can enter when a wall is dug or breaks.
+//
+// It also counts the open air the copy passes through or beside, `caveAir`: every air cell of the envelope
+// and its shell lying CAVE_BELOW_SURFACE or more under `surfY`. Air that deep is a cave, and a descent dug
+// through one has no floor or wall there.
+function checkCopyHazards(bot, segment, surfY = Infinity) {
+  const m = STAIRCASE_SAFETY.PRISM_MARGIN;
+  const fluidChecked = new Set();
+  let caveAir = 0;
+
+  for (const v of segment.voxels) {
+    const [wx, wy, wz] = v;
+    // Envelope cell + margin shell — fluids anywhere here flood the descent.
+    for (let dx = -m; dx <= m; dx++) {
+      for (let dy = -m; dy <= m; dy++) {
+        for (let dz = -m; dz <= m; dz++) {
+          const x = wx + dx, y = wy + dy, z = wz + dz;
+          const key = `${x},${y},${z}`;
+          if (fluidChecked.has(key)) continue;
+          fluidChecked.add(key);
+          const block = bot.blockAt(new Vec3(x, y, z));
+          if (!block) return { safe: false, failureReason: 'unknown_block' };
+          if (SHAFT_FLUID_HAZARDS.has(block.name)) return { safe: false, failureReason: block.name };
+          if (y <= surfY - STAIRCASE_SAFETY.CAVE_BELOW_SURFACE && CAVE_AIR.has(block.name)) caveAir++;
+        }
+      }
+    }
+  }
+
+  // Gravity conduits: a sand/gravel column inside the envelope that drains into a fluid pours
+  // lava/water into the descent when disturbed — that IS a fluid hazard, so it stays a disqualifier.
+  // A gravity block that does NOT conduct is ignored (falling blocks are not a hazard). Checked on
+  // the envelope cells only.
+  // A cell the descent digs must be one the game breaks: bedrock, and every column the fleet reads as bedrock (the
+  // spawn-protected square: spawn_protection.maskWorldReads), refuses the swing (dig_authority).
+  for (const v of segment.voxels) {
+    const [wx, wy, wz] = v;
+    const block = bot.blockAt(new Vec3(wx, wy, wz));
+    if (block && block.diggable === false) return { safe: false, failureReason: 'unbreakable' };
+    if (block && SHAFT_GRAVITY_BLOCKS.has(block.name) && followGravityColumn(bot, wx, wy, wz) === 'CONDUIT') {
+      return { safe: false, failureReason: 'gravity_fluid_conduit' };
+    }
+  }
+
+  return { safe: true, failureReason: null, caveAir };
+}
+
+// evaluateStaircasePrism — project the diagonal staircase from a CANDIDATE transpose origin and hazard-
+// walk its copies top-down (shallowest first), accepting the safe prefix. The headframe↔staircase
+// join is resolved candidate-backed (no chair yet) through transposeAttachPoints, so this uses the
+// SAME join the locked site will. Returns { ok:false, reason } for no attach point / biome mismatch /
+// too-shallow / unsafe, or { ok:true, startX, startZ, surfaceY, lowestSafeY, depthReached,
+// safeCopies, haltReason }.
+//
+// settlesIn: a biome predicate (architect_config.settles). When passed, the build center's own biome
+// must settle, the same gate exploration uses to decide when to stop seeking (one list, Law 16). A candidate in a rejected biome is out before any hazard work.
+function evaluateStaircasePrism(bot, headframeBuilding, transposeOrigin, settlesIn) {
+  if (settlesIn) {
+    const biome = getBiomeName(bot, transposeOrigin.x, transposeOrigin.y, transposeOrigin.z);
+    if (!settlesIn(biome)) return { ok: false, reason: 'biome_mismatch', biome };
+  }
+  // Headframe attach A in world for THIS candidate — the staircase's first copy lands here.
+  const headAWorld = transposeAttachPoints(headframeBuilding, transposeOrigin).A;
+  if (!headAWorld) return { ok: false, reason: 'no_attach_point' };
+  const r = evaluateStaircaseFrom(bot, headAWorld, transposeOrigin.y, require('@perception/blueprint_survey').turnOf(transposeOrigin));
+  return r.ok ? { ...r, startX: transposeOrigin.x, startZ: transposeOrigin.z } : r;
+}
+
+// evaluateStaircaseFrom — THE DESCENT ITSELF, and the one judgment of whether a shaft may be dug there,
+// from the world point its first copy's inbound joint lands on. The headframe's check above resolves that point through
+// the headframe's attach A (Law 16). `surfY` is the ground the descent starts from. On success it also carries `prism` — the
+// staircase's horizontal reach {minX,maxX,minZ,maxZ} and its copy count — so a siter can keep the whole
+// diagonal, not just its mouth, clear of other buildings. `turn` is the descent's quarter turns from east.
+function evaluateStaircaseFrom(bot, headAWorld, surfY, turn = 0) {
+  // Project the descent to the required floor; hazard-walk the copies shallow → deep.
+  const proj = projectStaircase({ headAWorld, lowestSafeY: STAIRCASE_SAFETY.REQUIRED_DEPTH_Y, turn });
+  if (proj.segments.length === 0) {
+    return { ok: false, reason: 'too_shallow', haltReason: 'no_copy_fits' };
+  }
+
+  let lowestSafeY  = surfY;
+  let safeCopies    = 0;
+  let haltReason    = 'reached_target';
+  let caveAir       = 0;
+
+  for (const seg of proj.segments) { // proj.segments are already shallow → deep
+    const hz = checkCopyHazards(bot, seg, surfY);
+    if (!hz.safe) { haltReason = hz.failureReason; break; }
+    caveAir += hz.caveAir;
+    lowestSafeY = seg.world_position.y + proj.minVoxY; // this copy's deepest voxel Y
+    safeCopies++;
+  }
+
+  // Reach the floor, no matter what: the ENTIRE descent to REQUIRED_DEPTH_Y must be clean. A hazard
+  // anywhere short of the deepest projected copy means the required depth cannot be safely reached, so
+  // the site is out; a single fluid strike rejects the whole site. safeCopies===0 folds in.
+  if (safeCopies < proj.segments.length) {
+    return { ok: false, reason: 'unsafe_descent', depthReached: surfY - lowestSafeY, lowestSafeY, haltReason };
+  }
+  // A descent through or beside a cave has no wall or floor there: refused, however little of it there is.
+  if (caveAir > STAIRCASE_SAFETY.CAVE_AIR_MAX) {
+    return { ok: false, reason: 'cave_air', depthReached: surfY - lowestSafeY, lowestSafeY, haltReason, caveAir };
+  }
+
+  // The deep shaft turns its way down from here. `deep` is its route, locked with the site and dug only when a
+  // material asks for it (assessors/mining); null where none reaches the floor, and the site still makes a shallow shaft.
+  const floorY = require('@thinking/architect_config').SHAFT_TURNS.floor_y;
+  const below = routeBelow(bot, proj, surfY, floorY);
+  const deep = below ? { route: below.route, pieces: below.pieces, lowestSafeY: projectStaircase({ headAWorld, lowestSafeY: floorY, turn, route: below.route }).bottomY } : null;
+
+  // `prism` is the straight run from the surface: what a building on the ground has to keep clear of.
+  return {
+    ok: true,
+    startX: headAWorld.x, startZ: headAWorld.z,
+    surfaceY: surfY, lowestSafeY, depthReached: surfY - lowestSafeY, safeCopies,
+    haltReason, caveAir, deep,
+    prism: staircaseReach(proj),
+  };
+}
+
+// ── THE DEEP SHAFT TURNS ───────────────────────────────────────────────────────────────
+// routeBelow — from the bottom of the straight run, on down to floorY (architect_config.SHAFT_TURNS): a flight while
+// the rock ahead is clean, and where a flight is refused (fluid, cave air, ground not loaded, the shaft's own cells) a
+// landing to either side. A way that dead-ends is backed out of and turned earlier. No landing stands above
+// SHAFT_TURNS.first_turn_y, and a landing is always followed by a flight. Returns { route, pieces } or null, at most
+// SHAFT_TURNS.max_checks pieces walked.
+function routeBelow(bot, proj, surfY, floorY) {
+  const { max_checks, first_turn_y } = require('@thinking/architect_config').SHAFT_TURNS;
+  const claimed = new Map(proj.occupiedCells);
+  const last = proj.segments[proj.segments.length - 1];
+  let checks = 0;
+  const failed = new Set();
+  const lay = (piece) => {
+    const mine = [];
+    for (const v of piece.voxels) {
+      const key = `${v[0]},${v[1]},${v[2]}`;
+      const prev = claimed.get(key);
+      if (prev !== undefined && prev !== v[3]) { for (const k of mine) claimed.delete(k); return null; }
+      if (prev === undefined) { claimed.set(key, v[3]); mine.push(key); }
+    }
+    return mine;
+  };
+  const clean = (piece) => {
+    const hz = checkCopyHazards(bot, piece, surfY);
+    return hz.safe && hz.caveAir <= STAIRCASE_SAFETY.CAVE_AIR_MAX;
+  };
+  // walk(at, n, flightOnly) → the landings from piece n down, or null when no way down exists from here.
+  const walk = (at, n, flightOnly) => {
+    if (placePiece(at.origin, at.heading).minY < floorY) return { route: [], pieces: n };
+    const state = `${at.origin.x},${at.origin.y},${at.origin.z},${at.heading},${flightOnly}`;
+    if (failed.has(state)) return null;
+    for (const side of flightOnly || at.origin.y > first_turn_y ? [null] : [null, 'right', 'left']) {
+      if (++checks > max_checks) return null;
+      const piece = placePiece(at.origin, at.heading, side);
+      if (!clean(piece)) continue;
+      const mine = lay(piece);
+      if (!mine) continue;
+      const below = walk(piece.next, n + 1, !!side);
+      if (below) return side ? { route: [{ at: n, side }, ...below.route], pieces: below.pieces } : below;
+      for (const k of mine) claimed.delete(k);
+    }
+    failed.add(state);
+    return null;
+  };
+  return walk(placePiece(last.world_position, last.turn).next, proj.segments.length, false);
+}
+
+// staircaseReach(proj) — the horizontal box every voxel of a projected descent falls in.
+function staircaseReach(proj) {
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (const seg of proj.segments) {
+    for (const v of seg.voxels) {
+      if (v[0] < minX) minX = v[0];
+      if (v[0] > maxX) maxX = v[0];
+      if (v[2] < minZ) minZ = v[2];
+      if (v[2] > maxZ) maxZ = v[2];
+    }
+  }
+  return { minX, maxX, minZ, maxZ, copies: proj.segments.length };
+}
+
+module.exports = {
+  BUFFER_BLOCKS,
+  overlapsExisting,
+  CLEARABLE,
+  overheadClear,
+  SUFFICIENT_STAIRCASE_MATCHES,
+  getBiomeName,
+  evaluateStaircasePrism,
+  evaluateStaircaseFrom,
+  STAIRCASE_SAFETY,
+};

@@ -1,0 +1,401 @@
+// js_kernel/corporate_headquarters.js
+// Memory-primary shared state for all action and thinking fragments (Law 6).
+//
+// All reads and writes go through an in-memory cache. A periodic flush writes
+// the cache to disk as a human-inspectable snapshot — the file is an artifact,
+// not live data. Consumers never read from disk after startup.
+//
+// Per-bot file path: when BOT_ID is set (multi-bot mode), each bot process
+// gets its own file so two processes never collide on the same JSON.
+//
+// "Office" pattern: each fragment owns one top-level key (its office).
+// "Conference room" pattern: shared space with named chairs per fragment.
+// "Boardroom" pattern: bot_boardroom.<botId> — cross-bot state synced via foreman.
+
+const fs = require('fs');
+const path = require('path');
+const { durableWrite } = require('./durable_write');
+const { guardExternal, guardExternalSync, withCleanup, violation } = require('@utils/external_library_guard');
+
+const _botId = process.env.BOT_ID || '';
+// Per-bot file when BOT_ID is set: two bot processes on one host must never
+// flush into the same JSON (the debounce would silently stomp the other's state).
+const HQ_PATH = path.join(
+  __dirname,
+  _botId ? `corporate_headquarters.${_botId}.json` : 'corporate_headquarters.json'
+);
+
+const EMPTY_HQ = { schema: 'auren.corporate_headquarters.v1' };
+// How long a change waits in memory before the whole file is replaced on disk. The cache is the
+// authority while the body lives and the body's ending flushes at once, so this is only how much a hard
+// kill can lose. Each flush is a synced replace of the whole file, and a crew flushing together is the
+// machine's steadiest disk load, so the wait is long.
+const FLUSH_INTERVAL_MS = 60000;
+
+let _cache = null;
+let _dirty = false;
+let _flushTimer = null;
+let _flushing = null;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 1 — Cache management
+// Load from disk once on first access. All subsequent reads/writes use memory.
+// Periodic flush writes the cache to disk for human inspection (Law 6).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A FAILED LOAD IS A THROW, NEVER A COLD START (Law 13).
+//
+// Swallowing a read failure and returning an empty HQ is a way to lose this file with no crash at all:
+// something makes the file unreadable for a moment (a lock, a sync client, a virus scanner, or the
+// NUL-filled corpse a power cut leaves behind), the bot starts believing it has no memory, and the flush
+// timer then writes that emptiness OVER the only copy. The transpose origin, the station map and every
+// locked buildspot would be gone, permanently, with no error reported anywhere.
+//
+// The two cases are separated, because only one of them is normal. ABSENT means a genuine first run —
+// there is nothing to lose, so an empty HQ is the truth. PRESENT BUT UNREADABLE means the memory exists
+// and cannot be reached: not a cold start, a stop. The bot refuses to run blind and overwrite what it
+// could not read (default-stopped: prove it is safe to continue).
+function _loadFromDisk() {
+  if (!fs.existsSync(HQ_PATH)) return { ...EMPTY_HQ };   // first run — nothing to lose
+  const read = guardExternalSync('corporate_headquarters', `read ${HQ_PATH}`, () => fs.readFileSync(HQ_PATH, 'utf-8'));
+  if (!read.ok) {
+    if (read.error.code === 'ENOENT') return { ...EMPTY_HQ };   // first run — nothing to lose
+    throw violation('corporate_headquarters', `${HQ_PATH} exists but could not be READ (${read.error.code}: `
+      + `${read.error.message}). Refusing to start with empty memory — a flush would overwrite it. `
+      + `Resolve the file, then start again.`);
+  }
+  const raw = read.value;
+
+  const read2 = guardExternalSync('corporate_headquarters', `parse ${HQ_PATH}`, () => JSON.parse(raw));
+  if (!read2.ok) {
+    throw violation('corporate_headquarters', `${HQ_PATH} is present but not parseable (${read2.reason}). `
+      + `This is the fleet's persistent memory and it cannot be rebuilt from the world, so this is a `
+      + `STOP, not a cold start. If the file is damaged beyond repair, DELETE it deliberately — an `
+      + `absent file is a legitimate first run; an unreadable one is not.`);
+  }
+  const parsed = read2.value;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw violation('corporate_headquarters', `${HQ_PATH} parsed to ${Array.isArray(parsed) ? 'an array' : typeof parsed}, `
+      + `not an HQ object. Same rule as above: present-but-wrong is a stop, absent is a first run.`);
+  }
+  return parsed;
+}
+
+function _getCache() {
+  if (!_cache) {
+    _cache = _loadFromDisk();
+    _logColdStart();
+  }
+  return _cache;
+}
+
+function _logColdStart() {
+  // Lazily required, not guarded: the watcher pulls in nothing from this file, so there is no cycle for
+  // a catch to absorb — and a require that genuinely fails is a broken kernel, not a reason to boot
+  // silently with no record of what memory the fleet just loaded.
+  const _w = require('@kernel/watcher');
+
+  const keys = Object.keys(_cache).filter(k => k !== 'schema' && k !== 'updated_at');
+  _w.summary('corporate_headquarters', `Loaded HQ into memory from ${HQ_PATH} — ${keys.length} sections: [${keys.join(', ')}]`);
+
+  // EVERY LOCKED CENTRE IS LOGGED, not a single hardcoded key: the room's keys carry an owner
+  // (`headframe|<owner>`), so a fixed lookup would miss every one of them. Loading is also exactly when a
+  // reader wants to see how many bases this file remembers.
+  const rooms = _cache?.building_confrence_room || {};
+  for (const [key, entry] of Object.entries(rooms)) {
+    const bc = entry?.set_buildspot?.transpose_origin;
+    if (bc && typeof bc.x === 'number') {
+      _w.summary('corporate_headquarters', `Transpose origin ${key}: (${bc.x}, ${bc.y}, ${bc.z})`);
+    }
+  }
+
+  const shaft = _cache?.mining_confrence_room?.shaft_center;
+  if (shaft) {
+    _w.summary('corporate_headquarters', `Shaft center: (${shaft.x}, ${shaft.y}, ${shaft.z})`);
+  }
+
+  const stations = _cache?.logistics_confrence_room?.stations;
+  if (stations) {
+    _w.summary('corporate_headquarters', `Stations loaded: ${Object.keys(stations).length} tracked`);
+  }
+}
+
+function _markDirty() {
+  _dirty = true;
+  if (!_flushTimer) {
+    _flushTimer = setTimeout(_flushToDisk, FLUSH_INTERVAL_MS);
+    if (_flushTimer.unref) _flushTimer.unref();
+  }
+}
+
+function _flushToDisk() {
+  _flushTimer = null;
+  if (_flushing) return _flushing;
+  if (!_dirty || !_cache) return;
+  // At most one snapshot is writing; mutations during I/O coalesce into the next fresh snapshot.
+  _flushing = withCleanup('corporate_headquarters', 'flush memory', async () => {
+    while (_dirty) {
+      _dirty = false;
+      _cache.updated_at = new Date().toISOString();
+      const text = JSON.stringify(_cache, null, 2);
+      const flushed = await guardExternal('corporate_headquarters', `durable replace of ${HQ_PATH}`,
+        () => durableWrite(HQ_PATH, text));
+      if (!flushed.ok) { _dirty = true; return false; }
+    }
+    return true;
+  }, () => { _flushing = null; });
+  return _flushing;
+}
+
+async function flushNow() {
+  if (_flushTimer) { clearTimeout(_flushTimer); _flushTimer = null; }
+  if (!_cache) return true;
+  _dirty = true;
+  do {
+    if (await _flushToDisk() === false) return false;
+  } while (_dirty);
+  return true;
+}
+
+function reset() {
+  _cache = { ...EMPTY_HQ };
+  _dirty = true;
+  return flushNow();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 2 — Office API (unchanged signatures)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function readOffice(name, fallback = {}) {
+  const hq = _getCache();
+  return Object.prototype.hasOwnProperty.call(hq, name) ? hq[name] : fallback;
+}
+
+function writeOffice(name, data) {
+  const hq = _getCache();
+  hq[name] = data;
+  _markDirty();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 3 — Conference room API (unchanged signatures)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function readConferenceRoomChair(room, entryKey, chair, fallback = null) {
+  const hq = _getCache();
+  const value = hq?.[room]?.[entryKey]?.[chair];
+  return value === undefined ? fallback : value;
+}
+
+function writeConferenceRoomChair(room, entryKey, chair, data) {
+  const hq = _getCache();
+  if (!hq[room]) hq[room] = {};
+  if (!hq[room][entryKey]) hq[room][entryKey] = {};
+  hq[room][entryKey][chair] = data;
+  _markDirty();
+}
+
+function readConferenceRoomEntry(room, entryKey, fallback = null) {
+  const hq = _getCache();
+  const value = hq?.[room]?.[entryKey];
+  return value === undefined ? fallback : value;
+}
+
+function readConfRoomFlag(room, chair, fallback = null) {
+  const hq = _getCache();
+  const value = hq?.[room]?.[chair];
+  return value === undefined ? fallback : value;
+}
+
+function writeConfRoomFlag(room, chair, data) {
+  const hq = _getCache();
+  if (!hq[room]) hq[room] = {};
+  hq[room][chair] = data;
+  _markDirty();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 3b — THE BUILDING ROOM, WHICH IS THE ONE ROOM WITH AN OWNER IN ITS KEY
+// ─────────────────────────────────────────────────────────────────────────────
+// Two dedicated accessors, not thirty callers each spelling the key. Every read and write of a
+// structure's chair goes through these two, so HOW a building room is addressed is written in exactly
+// one place and cannot drift between the sites that write a home and the sites that look for one (Law 16).
+// `readConferenceRoomChair` stays a dumb store verb over any room — teaching it to rewrite a key for one
+// particular room would make an identical call mean two different things depending on a string argument,
+// the opaque behaviour Law 6 forbids.
+//
+// A CALLER PASSES THE PLAIN STRUCTURE NAME — `headframe`, `waste_pit`, `wheat_field` — and never
+// an owner. The owner half is supplied here from the process's own mandate (bot_mandate.buildingRoomKey),
+// which is what makes it a keycard: a caller cannot address another crew's base because there is no
+// argument in which to name one (Law 27).
+//
+// READS OF THE WHOLE ROOM DO NOT COME THROUGH HERE. find_buildingspot's footprint rejection and
+// blueprint_survey's protected-block walk read `readOffice('building_confrence_room')` raw, on purpose:
+// they need EVERY owner's structures so crews refuse to site or dig on top of each other. Write your own,
+// read everyone's — the same split station_registry runs between `getStations(null)` and its owner gate.
+function readBuildingChair(name, chair, fallback = null) {
+  const { buildingRoomKey } = require('@kernel/bot_mandate');
+  return readConferenceRoomChair('building_confrence_room', buildingRoomKey(name), chair, fallback);
+}
+
+// A BASE'S LOCATION IS WRITTEN ONLY BY THE FOREMAN'S HUB (`foreman_hub.lockSite`), never by a bot: a
+// re-site after a wipe is decided there, and the later event wins in `pickBuildingEntry` when the
+// broadcast lands here. A bot asking to write `set_buildspot` is a coding fault, refused by name — the
+// chairs ABOUT a base (`blueprint_paster`, `building_integrity`, …) are still the bot's to write.
+function writeBuildingChair(name, chair, data) {
+  const { buildingRoomKey } = require('@kernel/bot_mandate');
+  const key = buildingRoomKey(name);
+  if (chair === 'set_buildspot') {
+    throw new Error(`[corporate_headquarters] CODING VIOLATION (Law 13): a bot asked to write the location of '${key}'. `
+      + 'Only the foreman sets points (foreman_hub.lockSite); a body reads its base from the broadcast.');
+  }
+  return writeConferenceRoomChair('building_confrence_room', key, chair, data);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 4 — Bot boardroom API
+// Each bot owns one named chair. The foreman broadcasts other bots' chairs.
+// Local planners read all chairs; only this bot writes its own.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function readBoardroomChair(botId, fallback = null) {
+  const hq = _getCache();
+  return hq?.bot_boardroom?.[botId] ?? fallback;
+}
+
+function writeBoardroomChair(botId, data) {
+  const hq = _getCache();
+  if (!hq.bot_boardroom) hq.bot_boardroom = {};
+  hq.bot_boardroom[botId] = data;
+  _markDirty();
+}
+
+function getFullBoardroom(fallback = {}) {
+  const hq = _getCache();
+  return hq?.bot_boardroom ?? fallback;
+}
+
+// releaseAbsentBotMagnets(connectedBotIds, selfId) — void every magnet held by a bot that is NOT
+// currently connected to the foreman. Returns the ids released (empty = nothing to do).
+//
+// THE MAGNET IS THE RIGHT UNIT: a chest lock is not separate state — it lives INSIDE the magnet as
+// `magnet.chest_locks`, so one clearMagnet() releases the job claim and every chest with it.
+//
+// THE CONNECTED ROSTER DRIVES THIS, re-sensed on every broadcast, with the holder re-checked against it
+// each time (Invariant B: never act on remembered state). A missed message cannot leak, because the next
+// broadcast restates the whole truth — surviving even a hard kill of the server window, which takes
+// every bot and the foreman at once with no handler run anywhere; an unreleased chair would otherwise
+// sit on a surviving bot's disk, magnet and locks intact, and be read back as gospel on the next run.
+//
+// THE SELF CHAIR IS NEVER TOUCHED: this bot is by definition connected (it just received a broadcast),
+// it owns its own chair (Invariant D), and its own live magnet is mid-job.
+function releaseAbsentBotMagnets(connectedBotIds, selfId) {
+  const hq = _getCache();
+  const board = hq?.bot_boardroom;
+  if (!board || !Array.isArray(connectedBotIds)) return [];
+  const connected = new Set(connectedBotIds);
+  const released = [];
+  for (const [botId, chair] of Object.entries(board)) {
+    if (botId === selfId || connected.has(botId)) continue;
+    if (!chair || !chair.magnet) continue;
+    chair.magnet = null;
+    released.push(botId);
+  }
+  if (released.length) _markDirty();
+  return released;
+}
+
+// Merge other bots' chairs from an foreman broadcast.
+// Only writes to bot_boardroom — never touches local conference rooms or offices.
+function mergeBroadcastChairs(chairs) {
+  const hq = _getCache();
+  if (!hq.bot_boardroom) hq.bot_boardroom = {};
+  for (const [id, chair] of Object.entries(chairs)) {
+    hq.bot_boardroom[id] = chair;
+  }
+  _markDirty();
+  for (const wake of [..._chairWaiters]) wake();
+}
+
+// A PEER'S WORD WAKES ITS WAITER. onNextChairs(fn) calls fn once, when the next broadcast of peers' chairs has been
+// merged; offNextChairs(fn) withdraws it. A body waiting on what a peer says (pen_gate.waitFor) reads again the
+// moment the word lands instead of on its next poll.
+const _chairWaiters = new Set();
+function onNextChairs(fn) {
+  const once = () => { _chairWaiters.delete(once); fn(); };
+  once.fn = fn;
+  _chairWaiters.add(once);
+}
+function offNextChairs(fn) {
+  for (const w of _chairWaiters) if (w.fn === fn) _chairWaiters.delete(w);
+}
+
+// Merge the foreman's relayed station map into logistics_confrence_room.stations
+// (Phase 6 multi-bot sync). A station id is a unique world voxel, so the merge is
+// last-writer-wins per id keyed on the entry's `updated_at` stamp (station_registry
+// stamps every write). Incoming entries only overwrite when at least as fresh, so a
+// bot's own newer local edit is never clobbered by another bot's stale copy. This
+// path never REMOVES an entry, and it does not need to: a removal arrives as an ordinary
+// entry carrying `removed_at` (station_registry's tombstone), so it merges by the same
+// freshness rule as any other write and the readers there drop it. The merge stays a pure
+// add/refresh relay (Law 3: no decisions, only routing/merging state).
+//
+// THE PREMISE THAT STOOD HERE WAS FALSE, and it is worth naming because it is the natural one to
+// re-adopt: it said deletion was handled locally by each bot dropping a dug-up station when it can
+// see the empty voxel. A local delete cannot survive this function — the loop reads INCOMING keys,
+// so a key that is absent is no-news and the remembered entry stays. The deleting bot then received
+// its own dead station back on the next broadcast and struck it again, forever.
+function mergeBroadcastStations(stations) {
+  if (!stations || typeof stations !== 'object') return;
+  const hq = _getCache();
+  if (!hq.logistics_confrence_room) hq.logistics_confrence_room = {};
+  const local = hq.logistics_confrence_room.stations || {};
+  require('@foreman/message_schema').mergeFresherRows(local, stations);
+  hq.logistics_confrence_room.stations = local;
+  _markDirty();
+}
+
+// Merge the foreman's relayed fleet structures into building_confrence_room.
+// The fleet has ONE of each structure — a bot whose room lacks the headframe
+// ADOPTS the peer's established entry verbatim, so its own planner sees the
+// home as set (no duplicate buildspot) and every downstream consumer (mining
+// shaft site, building integrity, anchors) reads the same coordinates. The
+// merge rule (first-writer-wins on locked_at) lives in message_schema so bot
+// and foreman apply the identical contract (Law 16).
+function mergeBroadcastBuildings(buildings) {
+  if (!buildings || typeof buildings !== 'object') return;
+  const { pickBuildingEntry } = require('@foreman/message_schema');
+  const hq = _getCache();
+  if (!hq.building_confrence_room) hq.building_confrence_room = {};
+  const local = hq.building_confrence_room;
+  for (const [key, entry] of Object.entries(buildings)) {
+    if (!entry || typeof entry !== 'object') continue;
+    local[key] = pickBuildingEntry(local[key], entry);
+  }
+  _markDirty();
+}
+
+module.exports = {
+  HQ_PATH,
+  readOffice,
+  writeOffice,
+  readConferenceRoomChair,
+  writeConferenceRoomChair,
+  readBuildingChair,
+  writeBuildingChair,
+  readConferenceRoomEntry,
+  readConfRoomFlag,
+  writeConfRoomFlag,
+  readBoardroomChair,
+  writeBoardroomChair,
+  getFullBoardroom,
+  mergeBroadcastChairs,
+  onNextChairs,
+  offNextChairs,
+  releaseAbsentBotMagnets,
+  mergeBroadcastStations,
+  mergeBroadcastBuildings,
+  flushNow,
+  reset,
+};

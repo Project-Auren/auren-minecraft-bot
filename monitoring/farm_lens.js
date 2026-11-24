@@ -1,0 +1,467 @@
+// Auren_Bot/monitoring/farm_lens.js
+// HOW THE FARM WENT — the wheat field's own reducer, kept apart from build_lenses' per-site scan because
+// the farm is tended as well as built, with progress carried in
+// lines no building writes: the census, the per-row tend report, the seed picks. build_lenses.runMilestones
+// prints this after the structures; `--farm` prints it alone.
+//
+// EVERY NUMBER IS READ OFF A LINE THE FLEET WROTE; nothing is inferred from a gap. The lines, and who writes them:
+//   ROWS SITED        set_buildspot        `Locked wheat_field build site — transpose_origin (x,y,z)`
+//   GATED             job_board            `🚧 GATED <gate> (n): <why> → farm_tend#<crop> [detail], …`
+//   CLAIMED           dispatcher           `Claimed [band] farm/farm_tend …` / `supply/wheat_seeds` / `supply/dirt`
+//   CENSUS            farming_integrity    `farm census "wheat_field" — L/S row(s) laid of N · structure P/T placed, …`
+//                                          and the `rows:` line beneath it — the farm's integrity scan
+//   TENDED            farm_executor        `farm_executor: <roomKey> struct(place=,dig=) cleared= tilled= planted= …`
+//   VISIT             farm_manager         `farm_manager: cluster visit serviced V plot(s) — worked=W refused=R`
+//   SEEDS             seed_picker          `Seed pick done: +N wheat_seeds in P/M punch(es) …`
+//   PREP              land_prep            hoe crafted/retrieved, seeds and bone meal pulled from a chest
+//   BUILT             job_board            `🏁 STRUCTURE BUILT: 'wheat_field'` (+ STANDING / UN-BUILT)
+// A milestone that has not happened is printed as a BOOLEAN FIELD set false in `farm_milestones`, never
+// omitted (Law 25); `farm_census_latest` prints the latest reading on every run regardless.
+//
+// Seam as build_lenses: inputs as ARGUMENTS, render through data_out, RETURN an empty array — kept because
+// build_lenses.runMilestones iterates renderFarm's result, even though every field now goes to data_out.
+//
+// OUTPUT IS DATA, NOT PROSE. Field names and values only — no sentence is composed
+// here. Values that are strings are COPIED: a gate's own `why` clause, a row key, a seed-pick outcome, a
+// bot id, a structure name, a timestamp. See data_out.js for the rule.
+
+'use strict';
+
+const { relativeTime, PASSIVE_LINE } = require('./trace_read');
+const out = require('./data_out');
+
+const LOCK_RE = /Locked (\S+) build site — transpose_origin \(([^)]+)\)/;
+const GATED_RE = /🚧 GATED (\S+) \((\d+)\): (.+)$/;
+const CLAIM_RE = /Claimed \[[^\]]*\] (farm\/farm_tend|supply\/wheat_seeds|supply\/dirt)\b/;
+const CENSUS_RE = /farm census "([^"]+)" — (\d+)\/(\d+) row\(s\) laid of (\d+) · structure (\d+)\/(\d+) placed, (\d+) to dig · crop cells (\d+): (\d+) growing, (\d+) mature, (\d+) tilled unsown, (\d+) untilled, (\d+) blocked/;
+const ROWS_RE = /\] 📊 {2,}rows: (.+)$/;
+const TEND_RE = /farm_executor: (\S+) struct\(place=(\d+),dig=(\d+)\) cleared=(\d+) tilled=(\d+) planted=(\d+) harvested=(\d+) drops=(\d+)(?: bonemealed=(\d+))?(.*)$/;
+const VISIT_RE = /farm_manager: cluster visit serviced (\d+) plot\(s\) — worked=(\d+) refused=(\d+)( \[STUCK)?/;
+const SEED_PICK_RE = /Seed pick done: \+(\d+) wheat_seeds in (\d+)\/(\d+) punch\(es\) \(total \d+\) — (.+)\.$/;
+// ── WHERE SEEDS COME FROM, AND THE ONE THAT STOPS THEM ────────────────────────
+// SEED_DROP_RE is drop_collector banking a loose seed — a second inflow beside seed_picker's punches. It
+// carries no quantity (the line is bare), so it is counted and rendered as events, never summed with the
+// pick total: seed_picker's `+N` is an inventory delta already net of whatever its own punches dropped and
+// this collector banked, so adding them would double-count.
+//
+// SEED_ORDER_BLOCKED_RE is job_board refusing to post the field's seed order at all for want of a
+// registered home chest — a different fault from an order placed and left unfilled.
+const SEED_DROP_RE = /Picked up wheat_seeds\b/;
+const SEED_ORDER_BLOCKED_RE = /farm wants (\d+) seeds but no home chest is registered/;
+// Seconds a repeated condition must stay silent before it counts as CLEARED.
+const BLOCK_CLEARED_MARGIN_SEC = 120;
+const PUNCH_FAIL_RE = /\[SEED_PICKER\] punch did not clear grass/;
+// Needles into farm_executor's own tail and seed_picker's own outcome clause.
+const NO_SEEDS_RE = /\[no seeds\]/;
+const NO_HOE_RE = /\[no hoe\]/;
+const STOPPED_SHORT_RE = /^stopped short/;
+const PUNCH_BUDGET_RE = /^punch budget/;
+const SEED_ORDER_RE = /— (\d+) seeds ordered \((\d+) to sow, (\d+) reachable\)/;
+// The field's own verdict line (farming_integrity scanCluster), its words after "cluster:"; the phases and every hold it names.
+const CLUSTER_RE = /cluster: (\d+ plots.+|no plots located.+)$/;
+const DIRT_ORDER_RE = /— (\d+) dirt ordered \((\d+) for the rows/;
+const HOE_RE = /\[LAND_PREP\] 📊 (Crafted a wooden_hoe|Retrieved \S+ from chest)/;
+const PULLED_RE = /\[LAND_PREP\] 📊 Pulled (\d+) (wheat_seeds|bone_meal) from chest/;
+const BUILT_RE = /🏁 STRUCTURE BUILT: '([^']+)'/;
+const STANDING_RE = /🏠 STRUCTURE STANDING AT FIRST SWEEP: '([^']+)'/;
+const UNBUILT_RE = /STRUCTURE UN-BUILT: '([^']+)'/;
+
+const FARM_JOB_IDS = ['farm_tend#', 'farm_supply_dirt', 'farm_supply_seeds', 'farm_supply_sugar_cane'];
+
+// The field and the alpha structure are the config's (architect_config.FARM_FIELD, ALPHA_STRUCTURE).
+function farmNames() {
+  const cfg = require(require('./lens_paths').bot('Thinking_fragments/architect_config.js'));
+  const field = cfg.FARM_FIELD;
+  return { structure: field.structure, rowPrefix: field.keys[0], rows: field.keys.length, alpha: cfg.ALPHA_STRUCTURE };
+}
+
+function reduceFarm(seg, botFilter) {
+  const names = farmNames();
+  const f = {
+    names, maxRel: 0,
+    sited: { count: 0, keys: new Set(), first: null, last: null, by: null },
+    gates: new Map(),            // gate → { posts, first, last, why }
+    claims: new Map(),           // label → { n, first, by: Map(bot→n) }
+    census: { first: null, latest: null, rowsLaid: [], firstPlaced: null, firstSown: null, firstMature: null, maxGrowing: 0, maxMature: 0 },
+    rowsLine: null,
+    tend: { visits: 0, rows: new Map(), bots: new Map(), totals: null, noSeeds: 0, noHoe: 0, refused: 0, firstTill: null, firstPlant: null, firstHarvest: null },
+    cluster: { visits: 0, stuck: 0, worked: 0, refused: 0 },
+    seeds: { picks: 0, gained: 0, punches: 0, outcomes: new Map(), punchFails: 0, pulled: 0, latestOrder: null,
+             drops: 0, blocked: 0, blockedWant: null, blockedFirst: null, blockedLast: null },
+    dirt: { latestOrder: null },
+    clusterLines: [],             // { t, bot, text } each time the field's verdict line changed
+    clusterLast: null,
+    tools: { hoeCrafted: 0, hoeRetrieved: 0, boneMealPulled: 0 },
+    built: null, standing: null, unbuilt: [], alphaBuilt: null, alphaStanding: null,
+  };
+  const zero = () => ({ place: 0, dig: 0, cleared: 0, tilled: 0, planted: 0, harvested: 0, drops: 0, bonemealed: 0, visits: 0 });
+  f.tend.totals = zero();
+
+  // ONE CLOCK FOR THE WHOLE FLEET: every time here is wall-clock seconds from the first stamped line in
+  // the run, not each bot's own [Nm Ss] tag, so a delta between two bots' events stays comparable.
+  let baseMs = null;
+  for (const l of seg) { const ms = l.iso ? Date.parse(l.iso) : NaN; if (!Number.isNaN(ms)) { baseMs = ms; break; } }
+  for (const l of seg) {
+    if (l.relSec == null) continue;
+    if (botFilter && l.bot !== botFilter) continue;
+    if (PASSIVE_LINE.test(l.raw)) continue;
+    const ms = l.iso ? Date.parse(l.iso) : NaN;
+    const t = (baseMs !== null && !Number.isNaN(ms)) ? Math.round((ms - baseMs) / 1000) : l.relSec;
+    f.maxRel = Math.max(f.maxRel, t);
+    let m;
+    if ((m = l.raw.match(LOCK_RE)) && m[1].startsWith(names.rowPrefix)) {
+      const s = f.sited;
+      if (!s.keys.has(m[1])) { s.keys.add(m[1]); s.count++; if (s.first === null) { s.first = t; s.by = l.bot; } s.last = t; }
+    } else if ((m = l.raw.match(GATED_RE))) {
+      if (!FARM_JOB_IDS.some(id => m[3].includes(id))) continue;
+      const g = f.gates.get(m[1]) || { posts: 0, first: null, last: null, why: null };
+      g.posts++; if (g.first === null) g.first = t; g.last = t;
+      // Keep the clause that names a farm job, so the reader sees WHY the farm was held, not the whole board.
+      g.why = m[3].split(' · ').filter(part => FARM_JOB_IDS.some(id => part.includes(id))).join(' · ');
+      f.gates.set(m[1], g);
+    } else if ((m = l.raw.match(CLAIM_RE))) {
+      const c = f.claims.get(m[1]) || { n: 0, first: null, firstBy: null, by: new Map() };
+      c.n++; if (c.first === null) { c.first = t; c.firstBy = l.bot; }
+      c.by.set(l.bot, (c.by.get(l.bot) || 0) + 1);
+      f.claims.set(m[1], c);
+    } else if ((m = l.raw.match(CENSUS_RE))) {
+      const r = { t, bot: l.bot, laid: +m[2], sitedRows: +m[3], of: +m[4], placed: +m[5], structTotal: +m[6], digs: +m[7],
+        cells: +m[8], growing: +m[9], mature: +m[10], tilledUnsown: +m[11], untilled: +m[12], blocked: +m[13] };
+      const c = f.census;
+      if (!c.first) c.first = r;
+      const best = c.rowsLaid.length ? c.rowsLaid[c.rowsLaid.length - 1].laid : 0;
+      // A row counts LAID the first time the census count rises past every earlier reading; a lower later
+      // count is a stale scan from the other bot, not a row undone — that event is UN-BUILT, read below.
+      if (r.laid > best) c.rowsLaid.push({ t, laid: r.laid, of: r.sitedRows, by: l.bot });
+      if (!c.firstPlaced && r.placed > 0) c.firstPlaced = r;
+      if (!c.firstSown && (r.growing + r.mature) > 0) c.firstSown = r;
+      if (!c.firstMature && r.mature > 0) c.firstMature = r;
+      c.maxGrowing = Math.max(c.maxGrowing, r.growing);
+      c.maxMature = Math.max(c.maxMature, r.mature);
+      c.latest = r;
+    } else if ((m = l.raw.match(ROWS_RE)) && l.raw.includes('[FARMING_INTEGRITY]')) {
+      f.rowsLine = { t, text: m[1] };
+    } else if ((m = l.raw.match(TEND_RE))) {
+      const add = (o) => {
+        o.place += +m[2]; o.dig += +m[3]; o.cleared += +m[4]; o.tilled += +m[5]; o.planted += +m[6];
+        o.harvested += +m[7]; o.drops += +m[8]; o.bonemealed += +(m[9] || 0); o.visits++;
+      };
+      const tend = f.tend;
+      tend.visits++;
+      add(tend.totals);
+      if (!tend.rows.has(m[1])) tend.rows.set(m[1], zero());
+      add(tend.rows.get(m[1]));
+      if (!tend.bots.has(l.bot)) tend.bots.set(l.bot, zero());
+      add(tend.bots.get(l.bot));
+      const tail = m[10] || '';
+      if (NO_SEEDS_RE.test(tail)) tend.noSeeds++;
+      if (NO_HOE_RE.test(tail)) tend.noHoe++;
+      for (const r of tail.matchAll(/refused x(\d+)/g)) tend.refused += +r[1];
+      if (tend.firstTill === null && +m[5] > 0) tend.firstTill = { t, by: l.bot, row: m[1] };
+      if (tend.firstPlant === null && +m[6] > 0) tend.firstPlant = { t, by: l.bot, row: m[1] };
+      if (tend.firstHarvest === null && +m[7] > 0) tend.firstHarvest = { t, by: l.bot, row: m[1] };
+    } else if ((m = l.raw.match(VISIT_RE))) {
+      f.cluster.visits++; f.cluster.worked += +m[2]; f.cluster.refused += +m[3]; if (m[4]) f.cluster.stuck++;
+    } else if ((m = l.raw.match(SEED_PICK_RE))) {
+      const s = f.seeds;
+      s.picks++; s.gained += +m[1]; s.punches += +m[2];
+      // outcome is a token naming which of three branches the pick line's tail matched.
+      const outcome = STOPPED_SHORT_RE.test(m[4]) ? 'stopped_short'
+        : PUNCH_BUDGET_RE.test(m[4]) ? 'punch_budget_spent'
+        : 'order_filled_early';
+      s.outcomes.set(outcome, (s.outcomes.get(outcome) || 0) + 1);
+    } else if (SEED_DROP_RE.test(l.raw)) {
+      f.seeds.drops++;
+    } else if ((m = l.raw.match(SEED_ORDER_BLOCKED_RE))) {
+      f.seeds.blocked++; f.seeds.blockedWant = +m[1];
+      if (f.seeds.blockedFirst === null) f.seeds.blockedFirst = t;
+      f.seeds.blockedLast = t;
+    } else if (PUNCH_FAIL_RE.test(l.raw)) {
+      f.seeds.punchFails++;
+    } else if ((m = l.raw.match(HOE_RE))) {
+      if (m[1].startsWith('Crafted')) f.tools.hoeCrafted++; else f.tools.hoeRetrieved++;
+    } else if ((m = l.raw.match(PULLED_RE))) {
+      if (m[2] === 'wheat_seeds') f.seeds.pulled += +m[1]; else f.tools.boneMealPulled += +m[1];
+    } else if ((m = l.raw.match(BUILT_RE))) {
+      if (m[1] === names.structure && !f.built) f.built = { t, by: l.bot };
+      if (m[1] === names.alpha && !f.alphaBuilt) f.alphaBuilt = { t, by: l.bot };
+    } else if ((m = l.raw.match(STANDING_RE)) && (m[1] === names.structure || m[1] === names.alpha)) {
+      if (m[1] === names.structure && !f.standing) f.standing = { t, by: l.bot };
+      if (m[1] === names.alpha && !f.alphaStanding) f.alphaStanding = { t, by: l.bot };
+    } else if ((m = l.raw.match(UNBUILT_RE)) && m[1] === names.structure) {
+      f.unbuilt.push({ t, by: l.bot });
+    }
+    // The field's verdict, kept on each change of wording with its counts masked, so a hold reads as one row per cause.
+    if ((m = l.raw.match(CLUSTER_RE))) {
+      const shape = m[1].replace(/d+/g, '#');
+      if (shape !== f.clusterLast) { f.clusterLast = shape; f.clusterLines.push({ t, bot: l.bot, text: m[1] }); }
+    }
+    // The cluster line carries the live orders; read them off whichever line has them, latest wins.
+    if ((m = l.raw.match(SEED_ORDER_RE))) f.seeds.latestOrder = { t, order: +m[1], toSow: +m[2], reachable: +m[3] };
+    if ((m = l.raw.match(DIRT_ORDER_RE))) f.dirt.latestOrder = { t, order: +m[1], planned: +m[2] };
+  }
+  return f;
+}
+
+function renderFarm(f, { verbose = false } = {}) {
+  const { names } = f;
+  // A time that never happened is null; data_out prints its ABSENT mark, not 0m 0s.
+  const at = t => (t == null ? null : relativeTime(t));
+  // A negative gap (two bots' boards seeing one event at different moments) prints no delta.
+  const since = (t, from) => (from != null && t != null && t >= from ? relativeTime(t - from) : null);
+
+  out.kv('structure', names.structure);
+  out.kv('rows_in_design', names.rows);
+  out.kv('alpha_structure', names.alpha);
+
+  // The first census of the run is the state the field was found in, not an event of the run — carried
+  // under its own `census_found` token, not a `first_*` one.
+  const c = f.census;
+  const found = r => c.first && r && r.t === c.first.t;
+
+  // THE TIMELINE IS SORTED BY FLEET TIME, not the order events are assembled in. Rows collect as
+  // [t, event, detail, bot, since_prev_row_laid] and print in time order; `event` is a token, `detail` and
+  // `bot` are values read off the record. Whether a milestone happened at all is in farm_milestones below.
+  const rows = [];
+  const event = (t, name, detail = null, bot = null, gap = null) => { if (t != null) rows.push([t, name, detail, bot, gap]); };
+
+  if (f.sited.count) {
+    event(f.sited.first, 'rows_sited_first', f.sited.count, f.sited.by);
+    if (f.sited.last !== f.sited.first) event(f.sited.last, 'rows_sited_last', f.sited.count, f.sited.by);
+  }
+  // The gate's own posts/last/why are in farm_gates; the timeline carries only when it first fired.
+  for (const [gate, g] of f.gates) event(g.first, 'gated', gate);
+  if (f.alphaStanding) event(f.alphaStanding.t, 'alpha_standing_at_first_sweep', names.alpha, f.alphaStanding.by);
+  if (f.alphaBuilt) event(f.alphaBuilt.t, 'alpha_built', names.alpha, f.alphaBuilt.by);
+
+  const tendClaim = f.claims.get('farm/farm_tend');
+  if (tendClaim) event(tendClaim.first, 'first_farm_claim', 'farm/farm_tend', tendClaim.firstBy);
+
+  if (c.first) event(c.first.t, 'census_found', c.first.laid, c.first.bot);
+  if (c.firstPlaced && !found(c.firstPlaced)) event(c.firstPlaced.t, 'first_block_placed', c.firstPlaced.placed, c.firstPlaced.bot);
+
+  // Rows laid during the run, in order; collapsed past eight unless --all, keeping the first and last three.
+  const laid = c.rowsLaid.filter(r => !(c.first && r.t === c.first.t));
+  const shown = verbose || laid.length <= 8 ? laid : [...laid.slice(0, 3), null, ...laid.slice(-3)];
+  let prev = null;
+  for (const r of shown) {
+    if (r === null) { event(prev.t, 'rows_omitted', laid.length - 6); prev = null; continue; }
+    event(r.t, 'row_laid', r.laid, r.by, prev ? relativeTime(r.t - prev.t) : null);
+    prev = r;
+  }
+
+  if (f.tend.firstTill) event(f.tend.firstTill.t, 'first_ground_tilled', f.tend.firstTill.row, f.tend.firstTill.by);
+  if (c.firstSown && !found(c.firstSown)) event(c.firstSown.t, 'first_crop_in_ground', c.firstSown.growing);
+  else if (!c.firstSown && f.tend.firstPlant) event(f.tend.firstPlant.t, 'first_seed_planted', f.tend.firstPlant.row, f.tend.firstPlant.by);
+  if (c.firstMature && !found(c.firstMature)) event(c.firstMature.t, 'first_crop_mature', c.firstMature.mature);
+  if (f.tend.firstHarvest) event(f.tend.firstHarvest.t, 'first_harvest', f.tend.firstHarvest.row, f.tend.firstHarvest.by);
+
+  if (f.built) event(f.built.t, 'farm_built', names.structure, f.built.by);
+  else if (f.standing) event(f.standing.t, 'farm_standing_at_first_sweep', names.structure, f.standing.by);
+  for (const u of f.unbuilt) event(u.t, 'farm_unbuilt', names.structure, u.by);
+
+  rows.sort((a, b) => a[0] - b[0]);   // Array.prototype.sort is stable, so same-instant events keep assembly order
+  out.section('farm_timeline');
+  out.table(['at', 'event', 'detail', 'bot', 'since_prev_row_laid'],
+    rows.map(r => [at(r[0]), r[1], r[2], r[3], r[4]]));
+
+  // What happened and what did not, as booleans — an absence is `false`, still printed below (Law 25).
+  out.section('farm_milestones');
+  out.kv('rows_sited', f.sited.count > 0);
+  out.kv('farm_tend_claimed', !!tendClaim);
+  out.kv('block_placed', !!c.firstPlaced);
+  out.kv('row_laid_this_run', laid.length > 0);
+  out.kv('crop_in_ground', !!c.firstSown);
+  out.kv('crop_mature', !!c.firstMature);
+  out.kv('harvested', !!f.tend.firstHarvest);
+  out.kv('farm_built', !!f.built);
+  out.kv('standing_at_first_sweep', !!f.standing);
+  out.kv('farm_unbuilt_events', f.unbuilt.length);
+  out.kv('census_lines_seen', c.latest ? true : false);
+
+  // Deltas named by their two endpoints, not composed into a clause.
+  out.section('farm_intervals');
+  out.kv('claim_after_alpha_built', tendClaim && f.alphaBuilt ? since(tendClaim.first, f.alphaBuilt.t) : null);
+  out.kv('built_after_alpha_built', f.built && f.alphaBuilt ? since(f.built.t, f.alphaBuilt.t) : null);
+  out.kv('built_after_rows_sited', f.built ? since(f.built.t, f.sited.first) : null);
+
+  if (f.gates.size) {
+    // `why` is the board's own clause, copied verbatim — the lens never says why a gate held.
+    out.section('farm_gates');
+    out.table(['gate', 'posts', 'first_at', 'last_at', 'why'],
+      [...f.gates].map(([gate, g]) => [gate, g.posts, at(g.first), at(g.last), g.why]));
+  } else {
+    out.zero('farm_gate_posts');
+  }
+
+  if (c.first) {
+    out.section('farm_census_first');
+    out.kv('at', at(c.first.t));
+    out.kv('bot', c.first.bot);
+    out.kv('rows_laid', c.first.laid);
+    out.kv('rows_sited', c.first.sitedRows);
+    out.kv('structure_placed', c.first.placed);
+    out.kv('structure_total', c.first.structTotal);
+    out.kv('growing', c.first.growing);
+    out.kv('mature', c.first.mature);
+  }
+
+  if (c.latest) {
+    const L = c.latest;
+    out.section('farm_census_latest');
+    out.kv('at', at(L.t));
+    out.kv('bot', L.bot);
+    out.kv('rows_laid', L.laid);
+    out.kv('rows_in_design', names.rows);
+    out.kv('structure_placed', L.placed);
+    out.kv('structure_total', L.structTotal);
+    out.kv('to_dig', L.digs);
+    out.kv('crop_cells', L.cells);
+    out.kv('growing', L.growing);
+    out.kv('mature', L.mature);
+    out.kv('tilled_unsown', L.tilledUnsown);
+    out.kv('untilled', L.untilled);
+    out.kv('blocked', L.blocked);
+    out.kv('peak_growing_this_run', c.maxGrowing);
+    out.kv('peak_mature_this_run', c.maxMature);
+  }
+
+  if (f.rowsLine) {
+    // farming_integrity's own per-row cells, one value per row, copied whole.
+    out.section('farm_rows_scan');
+    out.kv('at', at(f.rowsLine.t));
+    out.list('row', f.rowsLine.text.split(' | '));
+  }
+
+  const T = f.tend.totals;
+  out.section('farm_work_done');
+  out.kv('row_visits', f.tend.visits);
+  out.kv('rows_visited', f.tend.rows.size);
+  out.kv('placed', T.place);
+  out.kv('dug', T.dig);
+  out.kv('cleared', T.cleared);
+  out.kv('tilled', T.tilled);
+  out.kv('planted', T.planted);
+  out.kv('harvested', T.harvested);
+  out.kv('drops', T.drops);
+  out.kv('bonemealed', T.bonemealed);
+  out.kv('refused_acts', f.tend.refused);
+  out.kv('visits_with_no_seeds', f.tend.noSeeds);
+  out.kv('visits_with_no_hoe', f.tend.noHoe);
+
+  if (f.tend.bots.size) {
+    out.section('farm_work_by_bot');
+    out.table(['bot', 'visits', 'placed', 'tilled', 'planted', 'harvested'],
+      [...f.tend.bots].map(([bot, b]) => [bot, b.visits, b.place, b.tilled, b.planted, b.harvested]));
+  }
+  if (verbose && f.tend.rows.size) {
+    out.section('farm_work_by_row');
+    out.table(['row', 'visits', 'placed', 'dug', 'tilled', 'planted', 'harvested'],
+      [...f.tend.rows].map(([row, r]) => [row, r.visits, r.place, r.dig, r.tilled, r.planted, r.harvested]));
+  }
+
+  out.section('farm_cluster_visits');
+  out.kv('visits', f.cluster.visits);
+  out.kv('worked', f.cluster.worked);
+  out.kv('refused', f.cluster.refused);
+  out.kv('stuck', f.cluster.stuck);
+
+  // supply/dirt is every structure's dirt, not only the farm's; the job id in the `job` column says which order it is.
+  const CLAIM_KEYS = ['farm/farm_tend', 'supply/wheat_seeds', 'supply/dirt'];
+  out.section('farm_jobs_claimed');
+  out.table(['job', 'claims', 'first_at', 'first_by'],
+    CLAIM_KEYS.map(k => {
+      const x = f.claims.get(k);
+      return [k, x ? x.n : 0, x ? at(x.first) : null, x ? x.firstBy : null];
+    }));
+  const byBot = [];
+  for (const k of CLAIM_KEYS) {
+    const x = f.claims.get(k);
+    if (x) for (const [bot, n] of x.by) byBot.push([k, bot, n]);
+  }
+  if (byBot.length) {
+    out.section('farm_claims_by_bot');
+    out.table(['job', 'bot', 'claims'], byBot);
+  }
+
+  const S = f.seeds;
+  out.section('farm_seeds');
+  out.kv('pick_trips', S.picks);
+  out.kv('seeds_gained', S.gained);
+  out.kv('punches', S.punches);
+  out.kv('punches_cleared_nothing', S.punchFails);
+  out.kv('seeds_pulled_from_chest', S.pulled);
+  // Events, not a quantity — the pickup line carries no number, and it is not summed with the pick total
+  // (see SEED_DROP_RE above).
+  out.kv('loose_seed_pickups', S.drops);
+
+  if (S.outcomes.size) {
+    // The outcome token is the pick line's own tail, carried through the reducer untouched.
+    out.section('farm_seed_pick_outcomes');
+    out.table(['outcome', 'count'], [...S.outcomes].map(([k, n]) => [k, n]));
+  } else {
+    out.zero('farm_seed_pick_outcomes');
+  }
+
+  // ── A COUNT NEEDS ITS WINDOW ────────────────────────────────────────────────
+  // first_at, last_at and cleared let the reader see when the block held and whether it resolved, rather
+  // than reading a bare post count as never having placed an order all run.
+  if (S.blocked) {
+    // "cleared" means the condition stayed quiet past the margin, not merely that one more line followed it.
+    out.section('farm_seed_order_blocked');
+    out.kv('posts', S.blocked);
+    out.kv('seeds_wanted', S.blockedWant);
+    out.kv('first_at', at(S.blockedFirst));
+    out.kv('last_at', at(S.blockedLast));
+    out.kv('cleared', S.blockedLast !== null && (f.maxRel - S.blockedLast) >= BLOCK_CLEARED_MARGIN_SEC);
+  } else {
+    out.zero('farm_seed_order_blocked');
+  }
+
+  // ── A GAUGE, AND ITS FIELD NAME SAYS SO ─────────────────────────────────────
+  // `reachable` is inventory_lens.reachableByFleet at one instant — stock on hand, already net of every
+  // seed sown so far. A level and a total are different kinds of number, so the field name carries which
+  // kind this is (`..._at_last_sweep`).
+  if (S.latestOrder) {
+    out.section('farm_seed_stock');
+    out.kv('last_sweep_at', at(S.latestOrder.t));
+    out.kv('seeds_on_hand_at_last_sweep', S.latestOrder.reachable);
+    out.kv('seeds_to_sow_at_last_sweep', S.latestOrder.toSow);
+    out.kv('seeds_ordered_at_last_sweep', S.latestOrder.order);
+  }
+
+  if (f.dirt.latestOrder) {
+    out.section('farm_dirt');
+    out.kv('last_order_at', at(f.dirt.latestOrder.t));
+    out.kv('dirt_ordered', f.dirt.latestOrder.order);
+    out.kv('dirt_for_rows', f.dirt.latestOrder.planned);
+  }
+
+  // The field's verdict on each change of its wording (counts aside): the first 20, every one behind --all.
+  out.kv('cluster_verdicts', f.clusterLines.length);
+  if (f.clusterLines.length) {
+    out.section('farm_cluster_verdicts');
+    out.table(['at', 'bot', 'verdict'], (verbose ? f.clusterLines : f.clusterLines.slice(0, 20)).map(c => [at(c.t), c.bot, c.text]));
+  }
+
+  out.section('farm_tools');
+  out.kv('hoe_crafted', f.tools.hoeCrafted);
+  out.kv('hoe_retrieved', f.tools.hoeRetrieved);
+  out.kv('bone_meal_pulled', f.tools.boneMealPulled);
+
+  // Nothing left to hand back: every field went to data_out. The empty array keeps build_lenses'
+  // `for (const line of renderFarm(...))` loop valid without reaching into that file.
+  return [];
+}
+
+// --farm: the farm alone. --milestones prints the same block after the structures through renderFarm.
+function runFarm({ seg = [], traceName = '?', bot: botFilter = null, verbose = false } = {}) {
+  const f = reduceFarm(seg, botFilter);
+  out.kv('lens', 'farm');
+  out.kv('record', traceName);
+  out.kv('span', relativeTime(f.maxRel));
+  if (botFilter) out.kv('bot_filter', botFilter);
+  renderFarm(f, { verbose });
+}
+
+module.exports = { reduceFarm, renderFarm, runFarm };
