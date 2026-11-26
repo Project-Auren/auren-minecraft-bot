@@ -870,20 +870,101 @@ node Auren_Workshop/tools/lanista.js --bot=VedaBot --arena --time=noon --show=em
 node Auren_Workshop/tools/lanista.js --bot=VedaBot --arena --time=noon --show=emperor --board --crowd=10 --guard --kit=iron_sword,iron_helmet,iron_chestplate,iron_leggings,iron_boots
                                                                              # the same show run from the When Board (tools/when_board.js): open
                                                                              # http://127.0.0.1:7711/ on a second monitor; --board=<port> moves it
+node Auren_Workshop/tools/colosseum_show.js                                  # THE WHOLE SHOW, ONE COMMAND (tools/colosseum_show.js): see below
 ```
+
+**`tools/colosseum_show.js` raises the whole show in the order that keeps the body still until everything stands.** It takes
+the seat down, puts the `colosseum` save point back (`fleet_control restore`; refused unless clearing this seat
+is authorized, `--keep-world` skips it), raises the world, the set's cameras and the rider with a continue start whose body
+is held for the operator (`--go operator`: raised and placed, never started), puts the body on the centre stand, designates
+it the gladiator G-1 with its post (`verb sentry --kit=G-1 --post=<stand> --face=<throne>`), and runs lanista with the board,
+the crowd, the guards, the ruler and `--gladiator`. When the show ends, the fleet and the cameras come down. `--record=film`
+binds OBS for the board's record buttons.
+
+**The `colosseum` save point is kept for good.** It is the set placed, the cameras framed and the field empty, taken from a
+stopped seat with `fleet_control.js snapshot --name=colosseum --memory` (world in `world_snapshots/<world>/colosseum`, the
+fleet's memory in `memory_snapshots/<world>/colosseum`, both in the seat's `MinecraftServer`). Nothing overwrites or
+deletes it: `snapshot` refuses a name that exists, a rollback start only lays `<world>_fresh_start` over the live world,
+and `world_rollback.ps1 -Action prune` keeps every save point and the clean copy and counts `-Keep` over the rest. The
+seat is free for any other run, rollback or new seed: the bench finds the world that holds the save point, points the seat
+at it for the show (`level-name`) and back at the seat's own world when the show is over. To change the colosseum, take a
+save point under a new name and pass it with `--template=<name>`.
+
+**The show's order.** The board opens in the default browser. **Wave 0**: the arena opens empty, the gladiator bowing;
+the first Release stages round 1 behind the gates, and from there every round stages itself and waits for its Release.
+Every round ends with the set's drops wiped (`arena_set.clearDrops`), as does placing the set and opening the show.
+A round is staged only once the gladiator is back on the stand and bowing (the server's `is_sneaking` read); then the gates
+close, and the wave is summoned `GATE_SETTLE_MS` (1 s) later. A body left in a pen when the gates shut would see the staged
+wave with no bars between and go for it before the release.
+
+**The waves are the board's (`--show=book`, the bench's default).** The book is `tools/arena_set_waves.json`; with none,
+the `emperor` show stands in. A round is lines of monster, count and gate (north, south, east, west, or spread: one per
+gate in turn) and `every`: the seconds between gates. The gates open in the order north, east, south, west; each gate's
+bars disappear and that pen's monsters wake and walk out. Nothing is teleported. With `every` 0 every gate opens at once.
+A round stays open until its last gate has opened, whatever the body reports. The board's **Waves** panel loads the book
+when the page opens; an edit turns its **Commit waves** buttons (top and bottom) amber until committed. A commit is used at
+once: a round standing staged for its Release is cleared and staged again from the new book; otherwise the next staging
+reads it. After the last round, while the crowd waits to be dismissed, a commit that adds a round stages it at once (so
+does Release, when the book already holds one more); Release dismisses only when the book has no round left. A book that names a monster not offered, an empty round, or more mobs than a pen holds is refused in words and
+the old book stays.
+
+**The filming workflow (`colosseum_show`, which passes `--auto --fall-tnt`):** set the waves on the board, press Start
+recording, press Release once. Each round then stages and releases itself (2 s staged behind the bars); after a round
+the crowd's banner cheer runs out (4 s + 1 s) while G-1 walks home and bows, and the next round follows. The title reads
+only "WAVE n". When G-1 falls, its wave is not wiped: the TNT drops from the awning as the crowd raises red. The guards
+scan the crowd on their own side, a big turn to the far side every 4–5 looks; only the ruler watches the fight.
+
+**The show that films itself (`colosseum_show --take`, lanista `--take[=<intro seconds>]`, default 14):** nothing is
+pressed. Once everything stands and G-1 bows, round 1 is staged behind the gates, every camera starts recording, and
+round 1 is released the intro's seconds after the camera files began (the recorder's `rolledAt`). The book then runs
+back to back. When G-1 falls the take is cut 6 s after the last TNT has gone off; when it clears the book, 3 s after the
+last cheer. The cut wraps the take into its own folder, the show ends undismissed and the seat comes down. A recording
+that does not start releases nothing and the show stops.
+
+**The monsters offered** (`arena_show.BOOK_MOBS`): every hostile that is not a boss and fits a pen, the ghast excepted:
+creeper, zombie, husk, drowned (trident), zombie villager, skeleton, stray, bogged (bows), wither skeleton, spider, cave
+spider, witch, slime and magma cube (medium), blaze, breeze, silverfish, endermite, phantom, vindicator, pillager,
+evoker, vex, ravager, piglin brute and hoglin (kept from turning zombie), zoglin, warden, and three riders: the zombie
+horseman (a zombie with an iron spear on a saddled zombie horse), the spider jockey (a skeleton on a spider; both fight)
+and the chicken jockey (a baby zombie on a chicken). A mount that does not fight wakes and is cleared with its wave and is
+not counted: the round ends when the riders are dead. Neutrals that start no fight, water mobs, the shulker and the
+creaking are not offered. The velarium keeps the sun off, so zombies and skeletons fight at noon unburnt.
+
+**The gladiator (designation G, `custom_api/gladiator.js`)** fights as a terminator does (`combat_board.fightsAsTerminator`)
+and holds no terminator seat. Between fights the sentry watch walks it to its post, faces the throne and holds a crouch (the
+bow); it stands up before every look for a fight. It walks back the moment a pass finds nothing aggroed or fought,
+so from the post every gate is in its sight. `lanista --gladiator` waits for it to walk onto the stand
+itself and teleports it only from outside the arena (`gladiatorToPost`). Arming the sentry stands down the guard a body
+held for the operator keeps (`battle_stations.endGuard`), so the watch is the one occupant that fights; the judge
+re-arms the watch after each battle and reads a planner only for a turn that routes to one (a gladiator has none).
+
+**The set's cameras travel with the set.** `Auren_Workshop/tools/arena_set_cameras.json` keeps each fixed camera as an
+offset from the centre sand block and a facing. Placing the set, `arena_set.js --cameras` and lanista `--arena` write them
+into this machine's saved angles and move a camera already standing. Frame a shot by flying the seat, then
+`arena_set.js --save-cameras=4,5` keeps it as the set's.
 
 **The When Board (`tools/when_board.js`, `--board`)** is a page the show process hosts on this machine and closes with
 the show. One button per cue, each showing its state in words and colour (green on, red off, grey not usable now, amber
 busy or armed). It says when; the unit that owns the act says how. `--board` implies `--emperor`: a board press counts as
 the button or lever in the box, and both work at once.
 - **Release**: lets the staged wave out; after the last round, dismisses the crowd.
-- **Thumbs up / Thumbs down / Lower banners**: the crowd's banners. They go up one spectator at a time, each on its own
+- **Thumbs up / Thumbs down / Lower banners**: the crowd's banners, plain lime for up and red for down. A banner is shown,
+  not kept: each spectator cheers with it for 4 s and puts it away, back to an empty hand. They go up one spectator at a time, each on its own
   temper (eager, ready, late, and a doubter who raises the other banner first). The state is read
   off the puppets' own hands.
 - **Drop the TNT** (two presses): `--tnt=<n>` (default 16) lit TNT summoned under the awning over the sand. It wrecks the
   set; place it again with `arena_set.js --place` before the next show.
 - **Start / Stop recording**: grey on a machine with no recorder (`workstation.findRecorder()`), or while no recorder
   process is up. Each call runs in a child process, so the show's loop and the puppets' connections never stall on it.
+  Stop recording ends the take only; the show and the seat stay up.
+- **Shut everything down** (two presses, group "The seat"): the fleet and its server (`fleet_control down`, the world
+  saved) and the camera crew (`start_cameras -Down`). The show ends on its lost console; `colosseum_show` then points the
+  seat back at its own world.
+
+**The show's cues** go to `fleet_logs/show_cues/show_<start>.jsonl` for every show with a board (one row per release,
+gate opening, battle end, banner, TNT, recording start/stop, champion or fall, shutdown). After a take,
+`node Auren_Bot/monitoring/trace_monitor.js --show-cues` lays out the crowd's sound against it, timed from Start
+recording: the editor's cue sheet.
 
 **`--crowd`, `--guard`, `--ruler` are the show's people, not the swarm.** They are puppets from the operator's own npc
 module (`workstation.findNpc()`); a copy with none refuses the three flags and runs the arena with nobody watching.

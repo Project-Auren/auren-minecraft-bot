@@ -56,12 +56,26 @@ async function execute(verb, args = {}) {
         return;
       }
       require('@kernel/idle_scheduler').cancel();      // the planning recursion's heartbeat must not co-run (Law 4)
+      // A body held before its start stands guard (battle_stations standGuard); the watch takes its place, so the two never
+      // race for the same fight (Law 4). A fight the guard opened finishes first.
+      await require('@api/battle_stations').endGuard();
       const at = bot.entity.position.floored();
       // `--kit=<designation>` arms the watch on a designated body (combat_board THE DESIGNATION): the arena's bodies fight
       // as that designation does, a terminator never running. The kit's items are the arena director's to issue over RCON.
       if (args.kit) {
         require('@api/combat_board').designate(String(args.kit));
         watcher.summary('operator_commands', `sentry — the body is designated ${args.kit} from here.`);
+      }
+      // `--post` / `--face`: a gladiator's post (custom_api/gladiator), the operator's to author. A post given to a body that
+      // is not a gladiator is refused in words: it would hold nothing.
+      if (args.post) {
+        if (!require('@api/combat_board').isGladiator()) {
+          watcher.warn('operator_commands', `sentry — a post was given to a ${require('@api/combat_board').designation()} body, not a gladiator (G); it is not held.`);
+        } else {
+          require('@api/gladiator').setPost(args.post);
+          const { stand: s, face: f } = args.post;
+          watcher.summary('operator_commands', `sentry — the gladiator's post is (${s.x},${s.y},${s.z}), bowing toward (${f.x},${f.y},${f.z}).`);
+        }
       }
       require('@action/await_aggro.js').arm();
       watcher.summary('operator_commands',

@@ -56,7 +56,7 @@ const FLAGS = [
   { flag: 'count', env: 'AUREN_CREW_COUNT', help: 'how many bots the run raises, bounded by the available roster' },
   { flag: 'only', env: 'AUREN_CREW_ONLY', help: 'roster names raised and no others (comma-separated), in place of --count' },
   { flag: 'clock', env: 'AUREN_CLOCK', help: "'dawn', 'day' (pinned at midday) or 'held' (the world's own time)" },
-  { flag: 'go', env: 'AUREN_GO', help: "'now' (bots work as they arrive) or 'held' (every bot is raised and placed first, then all are released)" },
+  { flag: 'go', env: 'AUREN_GO', help: "'now' (bots work as they arrive), 'held' (every bot is raised and placed first, then all are released) or 'operator' (raised and placed, then left for the operator's own verb)" },
   { flag: 'record', env: 'AUREN_RECORD', help: "'off', 'cameras' (a camera window per bot) or 'film' (cameras + a recorder)" },
   { flag: 'watch', env: 'AUREN_WATCH', help: "'true' ends the run at the first stop listed in --wake, 'false' turns every stop off and the clock alone ends it" },
   { flag: 'wake', env: 'AUREN_WAKE', help: "the stops that end a run early: any of 'error,loop,crash,death,lost' (all of them, the default); one left out runs on through it (run_end_config.js)" },

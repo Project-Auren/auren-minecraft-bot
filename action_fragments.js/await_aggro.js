@@ -8,7 +8,8 @@
 // from reaching recursive_judge directly (battle_stations.js, branch S).
 //
 // No judge runs per pass — a watch is supposed to make no progress, so only the end of the watch reports.
-// A death does not send the bot back to its post; repositioning belongs to the arena director over RCON.
+// A death does not send the bot back to its post; repositioning belongs to the arena director over RCON. A living
+// gladiator (designation G) holds the post the operator gave it on every quiet pass: walk there, face, bow (gladiator).
 
 'use strict';
 
@@ -83,6 +84,7 @@ module.exports = {
       while (_watching) {
         let report;
         // One call and nothing else (Law 16); not guarded, since a throw here is a defect the watch ends on (Law 13), not a report to fabricate.
+        require('@api/gladiator').rise(global.bot);   // a gladiator's held bow ends before every look for a fight
         report = await battleStations(global.bot, 'sentry');
 
         const outcome = report.outcome;
@@ -119,6 +121,8 @@ module.exports = {
         } else {
           // A fight this body left unresolved (a peer's claim took the mob) closed and the same loop turns on: the watch stands again.
           if (outcome === 'clear' && previous !== null && previous !== 'clear') crewLog.post(TAG, 'sentry', { state: 'standing' });
+          // A gladiator with nothing to fight walks to its post and bows (custom_api/gladiator); every other body stands.
+          if (outcome === 'clear') await require('@api/gladiator').holdPost(global.bot);
           // No entity resolved — differs to the trace reader, not to the watch, which is still waiting.
           if (++quietPasses % QUIET_LOG_EVERY === 0) {
             watcher.summary(TAG, `👁️ Standing watch — ${quietPasses} quiet pass(es), no aggro (last: ${outcome}).`);
@@ -128,7 +132,7 @@ module.exports = {
 
         await sleep(POLL_MS);
       }
-    }, () => { _watching = false; });
+    }, () => { _watching = false; require('@api/gladiator').rise(global.bot); });
 
     // Law 8: one hop at the end of the watch, reporting the whole watch, not one pass (Law 25).
     const seconds = Math.round((Date.now() - startedAt) / 1000);

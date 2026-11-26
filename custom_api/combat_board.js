@@ -124,7 +124,11 @@ function crewTerminators() {
 const designation = () => _designation || require('@thinking/designations').DEFAULT;
 const kitWorn = () => (_parsed ? _parsed.kit : null);
 const engine = () => (_parsed ? _parsed.engine : null);
+// isTerminator: the base's terminator (T), the one that holds the seat and answers help calls. fightsAsTerminator: any
+// letter whose body fights as one (designations FIGHTS: T and G): never runs, heals in the fight, takes the pack.
 const isTerminator = () => !!_parsed && _parsed.letter === 'T';
+const fightsAsTerminator = () => !!_parsed && require('@thinking/designations').LETTERS[_parsed.letter].fights === 'terminator';
+const isGladiator = () => !!_parsed && _parsed.letter === 'G';
 
 // A claim is a battle: each one opened, this body's or a peer's, is counted where the claiming body stands (battle_ledger).
 function setClaim(claim) {
@@ -365,6 +369,6 @@ module.exports = {
   benchRole, onDuty, standDuty, endDuty, setWorking, guardKitted, guardOnDuty, tandemSeatOpen, guardSeatOpen, wardOf, workers, wards, beyondLeash, workedRecently, CONTACT_B,
   inSquad, isSquadmate, setClaim, claim, setSeen, setHelping, tick, receive, liveClaims, radar, blobOf, aimsElsewhere, reset,
   markTermination, sawDoomed, endTermination, doomed, doomedAt, terminationEnd, openTerminations,
-  designate, designation, kitWorn, engine, isTerminator, publishDesignation, crewTerminators,
+  designate, designation, kitWorn, engine, isTerminator, fightsAsTerminator, isGladiator, publishDesignation, crewTerminators,
   LEASE_MS, RADAR_REACH_B,
 };

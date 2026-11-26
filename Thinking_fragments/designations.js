@@ -24,6 +24,14 @@
 //      (assessors/terminator_duty, TERMINATOR_SEATS), and keeps it full time until its planner steps it down.
 //      It never runs from a fight (self_preservation), and it takes the pack a worker leaves be (combat_utils
 //      TERMINATOR_TAKES). Its kits are terminator_kits'.
+//   G  GLADIATOR: the arena picks its moves between fights. It is a terminator's body and fight (`fights`): it never runs,
+//      heals inside the fight and takes the pack a worker leaves be; it holds no terminator seat and answers no help call.
+//      Between fights it walks to its post on the sand, faces the box and bows until the next wave (custom_api/gladiator).
+//      Its post is the operator's, given with the `sentry` verb that designates it; it is armed only by that verb, so it
+//      has no planner and a planning turn for it is a coding violation. G-1 carries kit T-1.
+//
+// FIGHTS: what a letter's body fights as. 'terminator' (T, G): it never runs, heals in the fight, takes what a worker
+// leaves be (combat_board.fightsAsTerminator). A letter with no `fights` fights as a bot.
 //
 // ENGINES
 //   A  THE FIELD AHEAD (prediction_engine): FOR HUMAN PLAYERS. With a player in the field (combat_utils.fieldAheadOn), the
@@ -38,7 +46,8 @@ const { TERMINATOR_KITS } = require('./terminator_kits');
 const DEFAULT = 'B';
 const DEFAULT_PLANNER = 'job_board';
 const LETTERS = Object.freeze({
-  T: Object.freeze({ name: 'terminator', kits: TERMINATOR_KITS, planner: 'terminator_planner' }),
+  T: Object.freeze({ name: 'terminator', kits: TERMINATOR_KITS, planner: 'terminator_planner', fights: 'terminator' }),
+  G: Object.freeze({ name: 'gladiator', kits: Object.freeze({ 'G-1': TERMINATOR_KITS['T-1'] }), planner: null, fights: 'terminator' }),
 });
 const ENGINES = Object.freeze({ A: 'field_ahead' });
 
@@ -61,12 +70,16 @@ function parse(designation) {
 // plannerOf(designation) → the fragment that designation's planning turn goes to: the job board for a bot (DEFAULT), else
 // its letter's planner.
 function plannerOf(designation) {
-  return designation === DEFAULT ? DEFAULT_PLANNER : LETTERS[parse(designation).letter].planner;
+  if (designation === DEFAULT) return DEFAULT_PLANNER;
+  const row = LETTERS[parse(designation).letter];
+  if (row.planner === null) throw new Error(`[designations] CODING VIOLATION (Law 13): a planning turn reached ${designation}, a ${row.name}; its body is armed only by the operator's sentry verb and has no planner.`);
+  return row.planner;
 }
 
 for (const [letter, row] of Object.entries(LETTERS)) {
   if (letter === DEFAULT) throw new Error(`[designations] CODING VIOLATION (Law 13): ${DEFAULT} is the job board's body and carries no designation.`);
-  if (typeof row.planner !== 'string' || !row.planner) throw new Error(`[designations] CODING VIOLATION (Law 13): letter ${letter} names no planner; every letter's body plans through one.`);
+  if (row.planner !== null && (typeof row.planner !== 'string' || !row.planner)) throw new Error(`[designations] CODING VIOLATION (Law 13): letter ${letter} names no planner; a letter's body plans through one, or states null (armed only by the operator).`);
+  if (row.fights !== undefined && row.fights !== 'terminator') throw new Error(`[designations] CODING VIOLATION (Law 13): letter ${letter} fights as '${row.fights}'; known: terminator.`);
   for (const kit of Object.keys(row.kits)) {
     if (!kit.startsWith(`${letter}-`)) throw new Error(`[designations] CODING VIOLATION (Law 13): letter ${letter}'s kit '${kit}' is not named ${letter}-<number>.`);
   }

@@ -307,11 +307,13 @@ not a long leg).
 | flag | question |
 |---|---|
 | `--machine-load` | **Was the box struggling?** GPU use / memory / temperature / power, CPU, free RAM — as p50, p95 and MAX, because a spike is by definition the tail and an average hides it. Plus how late a sample landed. Written automatically during every filmed run; nothing to start. |
+| `--show-cues` | **Where does the crowd's sound go in this take?** An emperor's show (lanista `--board`) writes `show_cues/show_<start>.jsonl`, one row per release, gate opening, battle end, banner, TNT, recording start/stop, champion or fall. Per take (Start recording … Stop recording, else from the show's opening): the moments (`wave_start`, `roar_to_medium` per gate, `roar` on green banners, `boo` on red, `giant_roar` for the champion, `tnt`, `fall`) and the level under them (`dull` with no battle, `medium` from the first gate to the battle's end), each timed from the take's start. Not per monster. `--show=<part of a file name>` picks an older show; `--json` gives it as data. |
 | `--narration` | **What one unit SAID, in order.** The only lens here that is not a fold — every other one measures something and discards the rest, so a unit whose output is prose (a director narrating cuts, a preflight narrating what it verified) is counted by the merged view and shown by nothing. |
 
 ```
 node .\Auren_Bot\monitoring\trace_monitor.js --machine-load
 node .\Auren_Bot\monitoring\trace_monitor.js --machine-load --label=rollback
+node .\Auren_Bot\monitoring\trace_monitor.js --show-cues                        # the newest show's crowd sound sheet
 node .\Auren_Bot\monitoring\trace_monitor.js --narration                        # no --bot: lists who posted
 node .\Auren_Bot\monitoring\trace_monitor.js --narration --bot=camera_rig --full
 ```

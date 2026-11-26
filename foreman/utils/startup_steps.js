@@ -480,7 +480,7 @@ function foremanSteps({ getBot, BODY, connectBody, door, hub, startSoak, shutdow
       // one before it has made its first move — the operator's staggered start, given by the foreman.
       // Proved from each body's own first route search, so the soak counts from the go.
       name: 'the crew has its go',
-      when: () => plan.heldForGo(),
+      when: () => plan.foremanReleases(),
       act: async () => {
         const want = CLOCKS[plan.CONFIG.clock];
         if (want && !plan.continues()) await guardExternal('foreman', 'set the clock for the go', () => require('@utils/rcon_link').once([`time set ${want.time}`]));

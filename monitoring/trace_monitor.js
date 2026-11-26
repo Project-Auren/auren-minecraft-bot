@@ -42,6 +42,7 @@
 //   node trace_monitor.js --camera [--bot=AurenBot] [--all]
 //   node trace_monitor.js --witness [--bot=AurenBot] [--all]
 //   node trace_monitor.js --machine-load [--label=NAME] [--run-only]
+//   node trace_monitor.js --show-cues [--show=<file part>] [--json]
 //   node trace_monitor.js --watch [--interval=5] [--exit-on-flag[=error,halt]] [--max-minutes=15] [--stream=dispatcher] [--errors-known=N]
 //   node trace_monitor.js --around=<1m1s|ISO> [--lines=25 | --window=60 | --before=..|--after=..] [--tag=T] [--bot=B]
 //   node trace_monitor.js --from=<4m> --to=<7m> [--bot=B] [--tag=T] [--grep=<regex>] [--level=error] [--run=latest|N|all]
@@ -242,6 +243,8 @@ const WARNINGS = has('warnings');
 const WITNESS = has('witness');
 // --machine-load — the box's own record (GPU/CPU/RAM) while a filmed run is up.
 const MACHINE_LOAD = has('machine-load');
+// --show-cues [--show=<part of a show's file name>] [--json] — an emperor's show, as the crowd's sound sheet per take.
+const SHOW_CUES = has('show-cues');
 // --narration --bot=<unit> — a unit's own words, in order. --full widens the window past the last
 // `start` broadcast.
 const NARRATION = has('narration');
@@ -1314,6 +1317,7 @@ else if (FARM) runLens(require('./farm_lens').runFarm, { verbose });
     });
     process.exit(0);
   }
+  else if (SHOW_CUES) { recordingLens('show_cues_lens', '--show-cues').runShowCues({ show: opt('show', null), json: has('json') }); process.exit(0); }
   else if (NARRATION) {
     const all = wholeTrace();
     require('./narration_lens').runNarration({

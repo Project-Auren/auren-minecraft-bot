@@ -17,7 +17,14 @@
 //   node arena_set.js --place=<x>,~,<z>       # the same, the sand replacing the top of the ground at <x,z>
 //   node arena_set.js --gates=open|closed      # the four gates' iron bars, at the placed set (or --at=<x>,<y>,<z>)
 //   node arena_set.js --show                   # the placed set's named points in world coordinates
+//   node arena_set.js --cameras                # the set's fixed cameras put at their shots for the placed set
+//   node arena_set.js --save-cameras=4,5       # Cam_4 and Cam_5 as they stand now, kept as shots of the set
 // The placed centre is kept in ARENA_BOOK, keyed by the world's name, so lanista --arena finds it without coordinates.
+//
+// THE SET'S CAMERAS ARE PART OF THE SET, so no shot is tied to one seed's ground. ARENA_CAMERAS keeps each fixed camera as an offset from the centre sand block
+// and a facing, so the shots travel with the set to any seed, seat or server. Placing the set, `--cameras` and lanista
+// --arena write them into this machine's saved angles (camera_spots) at the placed centre, and move a camera already
+// standing there. Frame a shot by hand once (fly the seat), then `--save-cameras=<n>` keeps it as the set's.
 // Exit codes: 0 done · 1 could not run.
 
 'use strict';
@@ -242,12 +249,51 @@ function cellState(d, cell) {
 const ARENA_BOOK = path.join(__dirname, 'arena_set_book.json');
 function readBook() { return fs.existsSync(ARENA_BOOK) ? JSON.parse(fs.readFileSync(ARENA_BOOK, 'utf8')) : {}; }
 function worldName() {
-  const { bootstrapModules } = require('../workshop_paths'); bootstrapModules();
+  require('../workshop_paths').registerAliases();
   return require('@utils/server_settings').levelName(require('@utils/workstation').needServerDir());
 }
 // placed() → the world cell of the centre sand block of the set placed on this seat's world, or null.
 function placed() { const b = readBook()[worldName()]; return b ? b.center : null; }
 const toWorld = (c, p) => ({ x: c.x + p[0], y: c.y + p[1], z: c.z + p[2] });
+
+// ── THE SET'S CAMERAS: shots kept relative to the centre sand block ─────────────────────────────────
+const ARENA_CAMERAS = path.join(__dirname, 'arena_set_cameras.json');
+const round1 = v => Math.round(v * 10) / 10;
+function readCameras() { return fs.existsSync(ARENA_CAMERAS) ? JSON.parse(fs.readFileSync(ARENA_CAMERAS, 'utf8')) : {}; }
+// cameraShots(center) → { <number>: { pos, rotation } } in world coordinates: the set's shots at this placement.
+function cameraShots(center) {
+  return Object.fromEntries(Object.entries(readCameras()).map(([n, s]) =>
+    [n, { pos: [center.x + s.offset[0], center.y + s.offset[1], center.z + s.offset[2]], rotation: s.rotation }]));
+}
+// applyCameras(rcon, center) → lines: each shot kept in this machine's saved angles, and a camera already standing
+// moved onto it (one not up gets it when it joins).
+async function applyCameras(rcon, center) {
+  require('../workshop_paths').registerAliases();
+  const spots = require('@utils/camera_spots');
+  const lines = [];
+  for (const [n, s] of Object.entries(cameraShots(center))) {
+    spots.put(n, s);
+    const said = ((await rcon.command(`tp Cam_${n} ${s.pos.join(' ')} ${s.rotation.join(' ')}`)) || '').trim();
+    lines.push(`Cam_${n} at ${s.pos.map(round1).join(', ')} facing ${s.rotation.join(' / ')}${/^Teleported/i.test(said) ? ', moved there' : ', put there when it joins'}`);
+  }
+  return lines;
+}
+// saveCameras(center, numbers) → lines: each named camera as it stands now, kept as the set's shot (offset + facing).
+async function saveCameras(center, numbers) {
+  require('../workshop_paths').registerAliases();
+  const spots = require('@utils/camera_spots');
+  const book = readCameras(), lines = [];
+  for (const n of numbers) {
+    const seat = await spots.readSeat(`Cam_${n}`);
+    if (!seat.ok) { lines.push(`Cam_${n} NOT saved: ${seat.why}`); continue; }
+    const offset = [seat.spot.pos[0] - center.x, seat.spot.pos[1] - center.y, seat.spot.pos[2] - center.z].map(round1);
+    book[n] = { shot: (book[n] && book[n].shot) || `camera ${n}`, offset, rotation: seat.spot.rotation.map(round1) };
+    spots.put(n, { pos: seat.spot.pos, rotation: seat.spot.rotation });
+    lines.push(`Cam_${n} saved as the set's: offset ${offset.join(', ')} from the centre, facing ${book[n].rotation.join(' / ')}`);
+  }
+  fs.writeFileSync(ARENA_CAMERAS, `${JSON.stringify(book, null, 1)}\n`);
+  return lines;
+}
 
 // ── PLACEMENT ───────────────────────────────────────────────────────────────────────────────────────
 // Runs of one block along x become one fill; a fill is capped at 32768 cells by the server.
@@ -280,6 +326,15 @@ function commands(d, c) {
 }
 
 const FOOTING_DEPTH = 40;
+// clearDrops(rcon, center) → the server's answer: every dropped item inside the set's box (its bounds, a 2-block margin,
+// up to above the awning) removed. The set is a stage; loose items on it are clutter in the shot.
+async function clearDrops(rcon, center) {
+  const d = design();
+  const lo = toWorld(center, d.bounds.min), hi = toWorld(center, d.bounds.max), m = 2;
+  const said = ((await rcon.command(`kill @e[type=item,x=${lo.x - m},y=${lo.y - m},z=${lo.z - m},dx=${hi.x - lo.x + 2 * m},dy=${hi.y - lo.y + 6},dz=${hi.z - lo.z + 2 * m}]`)) || '').trim();
+  return /No entity/i.test(said) ? 'drops: none on the set' : `drops: ${said}`;
+}
+
 async function place(rcon, center) {
   const d = design(), c = center;
   const lo = toWorld(c, d.bounds.min), hi = toWorld(c, d.bounds.max);
@@ -303,6 +358,8 @@ async function place(rcon, center) {
   console.log(`[set] placing ${d.voxels.length} blocks in ${cmds.length} commands`);
   let i = 0;
   for (const cmd of cmds) { await run(cmd); if (++i % 1000 === 0) console.log(`[set]   ${i}/${cmds.length}`); }
+  // The clearing pops what stood on the cut ground (plants, torches, tree drops) as items; they go before the chunks unload.
+  console.log(`[set] ${await clearDrops(rcon, c)}`);
   await run(`forceload remove ${fl}`);
   // READ BACK (Law 23): the centre sand, a gate bar and the throne, asked of the server.
   const probes = [[0, 0, 0, 'sand'], [...d.points.gates[0].cells[0], 'iron_bars'], [...d.points.emperor.map((v, k) => (k === 1 ? v - 1 : v)), 'quartz_stairs'],
@@ -333,11 +390,14 @@ async function groundAt(rcon, x, z) {
   return { x, y: Math.floor(Number(m[2])) - 1, z };
 }
 
-async function setGates(rcon, center, open) {
+// setGates(rcon, center, open, only) → cells set: the bars of every gate, or only of the gates named in `only`, taken
+// away (open: the gate disappears) or put back.
+async function setGates(rcon, center, open, only = null) {
   const d = design();
-  const cmds = d.points.gates.flatMap(g => g.cells.map(cell => { const w = toWorld(center, cell); return `setblock ${w.x} ${w.y} ${w.z} ${open ? 'minecraft:air' : `minecraft:iron_bars${cellState(d, cell)}`}`; }));
+  const gates = only ? d.points.gates.filter(g => only.includes(g.gate)) : d.points.gates;
+  const cmds = gates.flatMap(g => g.cells.map(cell => { const w = toWorld(center, cell); return `setblock ${w.x} ${w.y} ${w.z} ${open ? 'minecraft:air' : `minecraft:iron_bars${cellState(d, cell)}`}`; }));
   for (const cmd of cmds) await rcon.command(cmd);
-  if (open) for (const g of d.points.gates) {
+  if (open) for (const g of gates) {
     const w = toWorld(center, g.cells[0]);
     await rcon.command(`playsound minecraft:block.iron_door.open block @a ${w.x} ${w.y} ${w.z} 2 0.6`);
     await rcon.command(`particle minecraft:poof ${w.x} ${w.y + 1} ${w.z} 1 1 1 0.02 20`);
@@ -363,10 +423,22 @@ async function main() {
       console.log(`[set] placed ${out.blocks} blocks (${out.commands} commands) centred on ${fmt(c)}; book: ${path.basename(ARENA_BOOK)}`);
       for (const s of out.refused.slice(0, 20)) console.log(`[set] ⚠ REFUSED ${s}`);
       for (const m of out.misses) console.log(`[set] ⚠ READ BACK FAILED: ${m}`);
+      for (const line of await applyCameras(rcon, c)) console.log(`[set] camera ${line}`);
       return out.refused.length || out.misses.length ? 1 : 0;
     }
     const c = args.at ? cell(args.at) : placed();
     if (!c) { console.error(`No set is placed on world '${worldName()}'. Place one with --place=<x>,<y>,<z>, or name it with --at.`); return 1; }
+    if (args.cameras) {
+      for (const line of await applyCameras(rcon, c)) console.log(`[set] camera ${line}`);
+      return 0;
+    }
+    if (args['save-cameras']) {
+      const numbers = String(args['save-cameras']).split(',').map(s => s.trim()).filter(s => /^[1-9]\d*$/.test(s));
+      if (!numbers.length) { console.error('--save-cameras needs camera numbers, as --save-cameras=4,5'); return 1; }
+      const lines = await saveCameras(c, numbers);
+      for (const line of lines) console.log(`[set] ${line}`);
+      return lines.some(l => /NOT saved/.test(l)) ? 1 : 0;
+    }
     if (args.gates) {
       const n = await setGates(rcon, c, args.gates === 'open');
       console.log(`[set] gates ${args.gates}: ${n} cells`); return 0;
@@ -384,4 +456,4 @@ async function main() {
 
 if (require.main === module) main().then(code => process.exit(code || 0));
 
-module.exports = { design, placed, toWorld, setGates, GATES, ARENA_BOOK };
+module.exports = { design, placed, toWorld, setGates, clearDrops, applyCameras, GATES, ARENA_BOOK, ARENA_CAMERAS };

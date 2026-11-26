@@ -106,8 +106,11 @@ function camerasStep({ record, count, fill, eye, pair = false, seats = null, onS
     act: async () => {
       result = await run(['raise', `--overlay=${record === 'film' ? 'record' : 'watch'}`, `--count=${count}`,
         ...(fill ? [] : ['--fill=off']), ...(eye ? ['--architect'] : []),
-        // The watch pair alone states the whole answer: the pair up, the person's seat down.
-        ...(pair ? [`--pair=${pair === 'rider' ? 'rider' : 'on'}`, '--architect=off'] : [])], seats ? { AUREN_SEATS: seats.join(',') } : null);
+        // The watch pair alone states the whole answer: the pair up, the person's seat down. Seats named for this
+        // run (AUREN_SEATS) are part of that answer, so they stand beside the pair.
+        ...(pair ? [`--pair=${pair === 'rider' ? 'rider' : 'on'}`,
+          ...(eye ? [] : (seats || process.env.AUREN_SEATS) ? ['--architect'] : ['--architect=off'])] : [])],
+      seats ? { AUREN_SEATS: seats.join(',') } : null);
       return result.code === 0 ? null : { give: `the camera overlay did not come up: ${tail(result.out)}` };
     },
     proof: async () => {

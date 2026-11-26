@@ -14,10 +14,10 @@
 const { sleep } = require('./lanista_shared');
 
 // ── THE SHOWS ───────────────────────────────────────────────────────────────────────────────────────
-// A round is a wave (lanista's `--wave` form) and, for a trickle, `every`: the wave is staged whole behind the closed
-// gates and let out one mob at a time, `every` seconds apart, through the gates in turn.
+// A round is a wave (lanista's `--wave` form) and `every`: the wave is staged whole behind the closed gates, spread one
+// mob per gate in turn, and the gates open `every` seconds apart (0: all at once).
 const SHOWS = {
-  // The emperor's schedule: one; one every 3 s from alternating gates for 30 s; then 2, 4, 6, 12, 24 at
+  // The emperor's first schedule, and the wave book's start: one; ten with the gates every 3 s; then 2, 4, 6, 12, 24 at
   // once. The run ends the round the body falls.
   emperor: [
     { wave: 'creeper:1' },
@@ -30,11 +30,85 @@ const SHOWS = {
   ],
 };
 
+// ── THE WAVE BOOK: the emperor's own rounds, edited on the When Board and kept between shows ─────────────────
+// WAVE_BOOK holds { rounds: [ { groups: [ { mob, count, gate } ], every } ] }. A group's `gate` is one of GATE_NAMES, or
+// 'spread' (one mob per gate in turn). `every` is the seconds between one gate opening and the next; 0 opens every gate
+// at once. Gates open in RELEASE_ORDER among those holding mobs. `--show=book` runs it, read again before every round,
+// so a round edited between rounds is the round that runs. A missing book starts as the emperor's schedule.
+const path = require('path');
+const fs = require('fs');
+const WAVE_BOOK = path.join(__dirname, 'arena_set_waves.json');
+const GATE_NAMES = ['north', 'south', 'west', 'east'];          // arena_set GATES, in its order
+const RELEASE_ORDER = ['north', 'east', 'south', 'west'];
+// The mobs the board offers: every hostile that is not a boss and fits a pen (3 wide, 3 high), the ghast excepted (too
+// big). The velarium closes the bowl overhead, so the sun burns none of them at noon. Each names what a summon does not
+// give it: `id` the entity when it differs from the name, `hand` the item it fights with, `nbt` its own fields, and
+// `mount` the mob it rides. A mount that does not fight (a horse, a chicken) is tagged MOUNT_TAG: it wakes and is cleared
+// with the wave and is not counted in the field, so a round ends when its riders are dead. Left out: the neutrals that
+// start no fight (enderman, piglin, zombified piglin), the water mobs (guardians), the shulker (it never leaves its pen),
+// the creaking (it needs a heart), the bosses and the ghast.
+const BOOK_MOBS = {
+  creeper: {}, zombie: {}, husk: {}, drowned: { hand: 'trident' }, zombie_villager: {},
+  skeleton: { hand: 'bow' }, stray: { hand: 'bow' }, bogged: { hand: 'bow' }, wither_skeleton: { hand: 'stone_sword' },
+  spider: {}, cave_spider: {}, witch: {}, slime: { nbt: 'Size:1' }, magma_cube: { nbt: 'Size:1' },
+  blaze: {}, breeze: {}, silverfish: {}, endermite: {}, phantom: {},
+  vindicator: { hand: 'iron_axe' }, pillager: { hand: 'crossbow' }, evoker: {}, vex: { hand: 'iron_sword' }, ravager: {},
+  piglin_brute: { hand: 'golden_axe', nbt: 'IsImmuneToZombification:1b' }, hoglin: { nbt: 'IsImmuneToZombification:1b' }, zoglin: {},
+  warden: {},
+  zombie_horseman: { id: 'zombie', hand: 'iron_spear', mount: { id: 'zombie_horse', nbt: 'equipment:{saddle:{id:"minecraft:saddle",count:1}}' } },
+  spider_jockey: { id: 'skeleton', hand: 'bow', mount: { id: 'spider', fights: true } },
+  chicken_jockey: { id: 'zombie', nbt: 'IsBaby:1b', mount: { id: 'chicken' } },
+};
+const MOUNT_TAG = 'arena_mount';
+const MAX_EVERY = 120;
+
+const fromShow = (rounds) => ({ rounds: rounds.map(r => ({
+  groups: r.wave.split(',').map(g => { const [mob, n] = g.split(':'); return { mob, count: parseInt(n, 10) || 1, gate: 'spread' }; }),
+  every: r.every || 0,
+})) });
+// checkBook(book, penPerGate) → { ok, book } | { ok:false, why }: every round fits its pens and names known mobs and gates.
+function checkBook(book, penPerGate) {
+  if (!book || !Array.isArray(book.rounds) || !book.rounds.length) return { ok: false, why: 'the book holds no round' };
+  for (const [i, r] of book.rounds.entries()) {
+    const at = `round ${i + 1}`;
+    if (!r || typeof r !== 'object' || !Array.isArray(r.groups) || !r.groups.length) return { ok: false, why: `${at} holds no monster` };
+    if (!Number.isFinite(r.every) || r.every < 0 || r.every > MAX_EVERY) return { ok: false, why: `${at}: gates every ${r.every}s is not 0–${MAX_EVERY}` };
+    const load = Object.fromEntries(GATE_NAMES.map(g => [g, 0]));
+    let spread = 0;
+    for (const g of r.groups) {
+      if (!g || typeof g !== 'object') return { ok: false, why: `${at}: a monster line is empty` };
+      if (!Object.prototype.hasOwnProperty.call(BOOK_MOBS, g.mob)) return { ok: false, why: `${at}: '${g.mob}' is not offered (${Object.keys(BOOK_MOBS).join(', ')})` };
+      if (!Number.isInteger(g.count) || g.count < 1) return { ok: false, why: `${at}: ${g.mob} count ${g.count} is not a whole number of 1 or more` };
+      if (g.gate !== 'spread' && !GATE_NAMES.includes(g.gate)) return { ok: false, why: `${at}: gate '${g.gate}' is not ${GATE_NAMES.join(', ')} or spread` };
+      if (g.gate === 'spread') for (let k = 0; k < g.count; k++) load[GATE_NAMES[(spread++) % GATE_NAMES.length]]++;
+      else load[g.gate] += g.count;
+    }
+    const over = GATE_NAMES.filter(g => load[g] > penPerGate);
+    if (over.length) return { ok: false, why: `${at}: the ${over.join(' and ')} pen holds ${penPerGate} and is asked for ${over.map(g => load[g]).join(' and ')}` };
+  }
+  return { ok: true, book };
+}
+// readBook() → the book on disk, or the emperor's schedule when none is saved.
+function readBook() { return fs.existsSync(WAVE_BOOK) ? JSON.parse(fs.readFileSync(WAVE_BOOK, 'utf8')) : fromShow(SHOWS.emperor); }
+// writeBook(book, penPerGate) → the check's answer; written only when it passes.
+function writeBook(book, penPerGate) {
+  const c = checkBook(book, penPerGate);
+  if (c.ok) fs.writeFileSync(WAVE_BOOK, `${JSON.stringify(book, null, 1)}\n`);
+  return c;
+}
+// bookRound(round) → lanista's form of one book round: the wave groups (with each mob's hand) and each group's gate.
+function bookRound(round) {
+  return {
+    wave: round.groups.map(g => ({ mob: g.mob, count: g.count, hand: (BOOK_MOBS[g.mob] || {}).hand || null, gate: g.gate })),
+    every: round.every || 0,
+  };
+}
+
 // showRounds(name, penCells) → { ok, rounds } or { ok:false, why }. A round larger than the pens would stack mobs
 // on one cell, so it is refused here, before anything is summoned.
 function showRounds(name, penCells) {
   const rounds = SHOWS[name];
-  if (!rounds) return { ok: false, why: `no show named '${name}' — declared: ${Object.keys(SHOWS).join(', ')}` };
+  if (!rounds) return { ok: false, why: `no show named '${name}' — declared: ${Object.keys(SHOWS).join(', ')}, or 'book'` };
   for (const [i, r] of rounds.entries()) {
     const count = r.wave.split(',').reduce((s, g) => s + (parseInt(g.split(':')[1], 10) || 1), 0);
     if (count > penCells) return { ok: false, why: `round ${i + 1} of '${name}' stages ${count} mobs and the pens hold ${penCells}` };
@@ -75,8 +149,9 @@ function createEmperor(rcon, set, center) {
   let watching = false, last = { up: null, down: null };
   const heard = [];
   // THE WHEN BOARD is a second hand on the same controls: a press there counts exactly as the block in the box does.
-  let waiting = null;              // what awaitRelease is holding for ('wave' | 'dismiss'), or null
+  let waiting = null;              // what awaitRelease is holding for ('stage' | 'wave' | 'dismiss'), or null
   let boardRelease = false;        // a board release press, taken by the waiting awaitRelease
+  let restaged = false;            // a committed wave book, taken by a staged round's awaitRelease as 'restage'
   let verdict = null;              // startLevers' onVerdict, so a board thumbs press reaches the same banners
 
   // The verdict levers, watched for the whole show: a lever thrown ON puts its banner up, whatever the round said.
@@ -104,12 +179,15 @@ function createEmperor(rcon, set, center) {
       return { ok: true };
     },
     // Resolves true the moment the release button reads pressed (in the box or on the board); false if the emperor
-    // never pressed it. `why` is what the board shows while it waits.
+    // never pressed it; 'restage' when the book was committed while it waited (restage()).
+    // `why` is what the board shows while it waits.
     async awaitRelease(why = 'wave') {
       const until = Date.now() + RELEASE_WAIT_MS;
       waiting = why;
       boardRelease = false;
+      restaged = false;
       while (Date.now() < until) {
+        if (restaged) { waiting = null; return 'restage'; }
         if (boardRelease || await powered(controls.release)) {
           heard.push({ at: Date.now(), control: 'release', from: boardRelease ? 'board' : 'box' });
           waiting = null;
@@ -122,13 +200,17 @@ function createEmperor(rcon, set, center) {
     },
     // What the release is waiting for, or null.
     waiting: () => waiting,
+    // restage() → what the release was waiting for ('wave': the staged round is staged again from the committed book;
+    // 'dismiss': the show reads the book for a further round), or false when nothing waits.
+    // While the crowd waits to be dismissed, a commit wakes the wait too, so a round added to the book is staged at once.
+    restage() { if (waiting !== 'wave' && waiting !== 'dismiss') return false; restaged = true; return waiting; },
     // press(k) → words. The board's press on control k: 'release' lets the waiting wave out (or dismisses the crowd);
     // 'up' | 'down' gives the emperor's verdict, as the lever does.
     async press(k) {
       if (k === 'release') {
         if (!waiting) return 'nothing is waiting on release';
         boardRelease = true;
-        return waiting === 'wave' ? 'released' : 'crowd dismissed';
+        return waiting === 'wave' ? 'released' : waiting === 'stage' ? 'wave 0: staging round 1' : 'crowd dismissed';
       }
       if (!verdict) return 'the verdict watch is not running';
       heard.push({ at: Date.now(), control: k, from: 'board' });
@@ -143,4 +225,4 @@ function createEmperor(rcon, set, center) {
   };
 }
 
-module.exports = { SHOWS, showRounds, dropTnt, createEmperor, RELEASE_WAIT_MS };
+module.exports = { SHOWS, showRounds, dropTnt, createEmperor, RELEASE_WAIT_MS, WAVE_BOOK, GATE_NAMES, RELEASE_ORDER, BOOK_MOBS, MOUNT_TAG, MAX_EVERY, checkBook, readBook, writeBook, bookRound };

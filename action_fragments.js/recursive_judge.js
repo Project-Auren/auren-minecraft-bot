@@ -192,6 +192,22 @@ async function handleSignal(signalType, signal) {
   // planning recursion's one door (Law 16).
   const sentryMode = require('@action/await_aggro').inSentry();
   if (sentryMode && !isSentryWave) {
+    // A FIGHT OPENED FROM THE WATCH'S OWN WALK. A gladiator walking back to its post is met by a mob: the walk's combat
+    // checkpoint fights it and abandons the walk, and the watch that ordered the walk, straight here. The watch is gone
+    // and the body is still in sentry, so it is re-armed exactly as a sentry wave is (await_aggro's rule: never after a
+    // death). Read from battle_stations' own sentence: an abandon carries no fields.
+    if (from === 'battle_stations' && typeof readable === 'string' && /^battle_stations: engagement (?!died\b)/.test(readable)) {
+      watcher.summary('recursive_judge',
+        `🛡️ SENTRY ARMED — a fight opened outside the watch chain ended: "${readable}". Re-arming the watch — no replan, no job_board.`);
+      const rearm = sequencer.stamp({
+        from: 'recursive_judge',
+        to: 'await_aggro',
+        task: 'await_aggro',
+        test: true,
+        readable: 'recursive_judge: a fight outside the watch chain ended — re-arming the sentry watch',
+      }, sequencer.examine(payload));
+      return signalBus.route(rearm.to, rearm);
+    }
     watcher.summary('recursive_judge',
       `🛡️ SENTRY ARMED — '${from || 'unknown'}' reported outside the watch chain, so there is nothing to replan into: ` +
       `halting instead of routing to job_board (no planning recursion in sentry). readable: ${readable || 'n/a'}`);
@@ -215,7 +231,9 @@ async function handleSignal(signalType, signal) {
   const outboundId = sequencer.examine(payload);
   // THE PLANNER'S DOOR, READ FROM TWO ORDERS: the run's test while one is on, else this body's designation's planner. Every
   // check above and below judges the turn whichever planner takes it. Call-time requires, the modules' own load cycles.
-  const planner = require('@action/test_module').plannerTarget()
+  // Read only by a turn that routes to it: a sentry wave re-arms the watch and plans nothing, so a body with no planner
+  // (a gladiator) is judged without one, and a planning route that reaches it still throws in plannerOf (Law 13).
+  const planner = () => require('@action/test_module').plannerTarget()
     || require('@thinking/designations').plannerOf(require('@api/combat_board').designation());
   const depart = (outPayload) => {
     const stamped = sequencer.stamp(outPayload, outboundId);
@@ -244,12 +262,12 @@ async function handleSignal(signalType, signal) {
 
     watcher.summary('recursive_judge',
       `Portable judge reported ${reason} in "${executor}" (forgiving mode) on ${pjJob}. ` +
-      `Routing to ${planner} for fresh evaluation — stall may resolve on retry.`);
+      `Routing to ${planner()} for fresh evaluation — stall may resolve on retry.`);
 
     const forgivingPayload = {
       from: 'recursive_judge',
-      to: planner,
-      task: planner,
+      to: planner(),
+      task: planner(),
     };
     return depart(forgivingPayload);
   }
@@ -282,16 +300,16 @@ async function handleSignal(signalType, signal) {
   // Skipped for a sentry wave, since a wave has no plan to refresh, only a next wave; the KILL_THRESHOLD
   // kill below still applies, so an actually-stuck bench still halts.
   if (contiguous === COGNITION_THRESHOLD && !isSentryWave) {
-    watcher.warn('recursive_judge', `⚠️ ${contiguous} identical outcomes — escalating to ${planner} for brain refresh`);
+    watcher.warn('recursive_judge', `⚠️ ${contiguous} identical outcomes — escalating to ${planner()} for brain refresh`);
     watcher.summary('recursive_judge',
       `Loop detected after \x1b[33m3 attempts\x1b[0m from "${from}": "${readable}". ` +
-      `\x1b[33mRouting to ${planner}\x1b[0m to re-evaluate before declaring engineering problem.`
+      `\x1b[33mRouting to ${planner()}\x1b[0m to re-evaluate before declaring engineering problem.`
     );
 
     const cognitionPayload = {
       from: 'recursive_judge',
-      to: planner,
-      task: planner,
+      to: planner(),
+      task: planner(),
     };
 
     return depart(cognitionPayload);
@@ -355,11 +373,11 @@ async function handleSignal(signalType, signal) {
   // Manager signals release the job to job_board; loop detection above still applies to a manager.
   if (MANAGERS.has(from)) {
     watcher.summary('recursive_judge',
-      `Manager "${from}" reporting: "${readable}". Routing to ${planner} for new job.`);
+      `Manager "${from}" reporting: "${readable}". Routing to ${planner()} for new job.`);
     const outPayload = {
       from: 'recursive_judge',
-      to: planner,
-      task: planner,
+      to: planner(),
+      task: planner(),
     };
     return depart(outPayload);
   }
@@ -384,12 +402,12 @@ async function handleSignal(signalType, signal) {
     return depart(outPayload);
   }
 
-  watcher.summary('recursive_judge', `→ ${planner}`);
+  watcher.summary('recursive_judge', `→ ${planner()}`);
 
   const outPayload = {
     from: 'recursive_judge',
-    to: planner,
-    task: planner,
+    to: planner(),
+    task: planner(),
   };
 
   return depart(outPayload);

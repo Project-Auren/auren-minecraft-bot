@@ -143,7 +143,7 @@ function onPhysicsTick(bot) {
 
   // A TERMINATOR NEVER RUNS (combat_board THE KIT WORN): it fights its fight out and heals inside it, standing where the fight
   // ended (commander THE REGEN). Only a worker runs home. Not even from a named monster: what a terminator meets it kills.
-  const terminator = require('@api/combat_board').isTerminator();
+  const terminator = require('@api/combat_board').fightsAsTerminator();
   if (!recovering && hp <= FLEE_HP && !terminator) recovering = true;
   if (recovering && (hp >= RETURN_HP || terminator)) recovering = false;
 

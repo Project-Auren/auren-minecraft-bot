@@ -1,0 +1,26 @@
+{
+ "4": {
+  "shot": "the ruler's seat, over ArchitectBot's shoulder",
+  "offset": [
+   1.7,
+   8.1,
+   -11.3
+  ],
+  "rotation": [
+   11.4,
+   42.9
+  ]
+ },
+ "5": {
+  "shot": "the overhead, south side under the awning",
+  "offset": [
+   0.3,
+   15.6,
+   16.4
+  ],
+  "rotation": [
+   -179.5,
+   32.4
+  ]
+ }
+}

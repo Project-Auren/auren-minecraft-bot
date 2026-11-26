@@ -132,4 +132,8 @@ function heard(line, log) {
   });
 }
 
-module.exports = { VERBS, seatNames, bySeat, run, heard };
+// put(number, spot) — keeps one shot under its number, the others untouched. For a shot authored elsewhere (a filming
+// set's cameras, placed relative to the set, arena_set).
+function put(number, spot) { write({ ...load(), [number]: spot }); }
+
+module.exports = { VERBS, seatNames, bySeat, run, heard, readSeat, put };

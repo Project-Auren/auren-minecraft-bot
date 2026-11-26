@@ -85,7 +85,9 @@ function watchStateFromEvents(events) {
   for (const ev of events) {
     if (ev.verb === 'sentry') {
       const st = ev.fields.state;
-      if (st === 'armed') { armed = true; armedAt = ev.at; }
+      // A watch armed anew holds no fight: an `engage` whose `end` never arrived (the run was stopped mid-fight, and a
+      // continue start appends to the same trace) does not read as engaged in the run that follows.
+      if (st === 'armed') { armed = true; armedAt = ev.at; open.clear(); }
       else if (st === 'disarmed') { armed = false; standing = false; armedAt = ev.at; }
       // `standing` implies armed — the watch loop only runs inside an armed session.
       else if (st === 'standing') { armed = true; standing = true; standingAt = ev.at; }

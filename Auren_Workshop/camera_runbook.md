@@ -77,6 +77,14 @@ Idempotent; re-running it is safe and is the repair path.
    ownership; the cameras then join the offline-mode local server under invented names forever after.
    No extra accounts, no extra purchases. Re-run the command after logging in.
 
+   **A new camera name's first launch can stall in Prism (2026-11-24).** Each new window name
+   (a new saved angle `Cam_<n>`, a new bot) is a new instance. Its first launch resolves the game version
+   from Prism's cached metadata; when that cache fails its checksum, Prism drops the launch and leaves
+   the window un-launched until someone clicks **Launch** on it. Later launches of the same instance
+   do not need it. `start_cameras.ps1` now asks once more for any window with no game process 60 s
+   after its launch, so the click should not be needed. If a new camera still sits unlaunched in
+   Prism, clicking Launch on it once completes the first launch.
+
    **No shaders, and no mod loader — this is settled, not a default to flip back.** A resource pack
    costs VRAM once at load; a shader pack costs GPU time on every frame and spikes hard whenever
    chunks build, and the fleet scales to 3–5 bots each with a camera, so that per-frame cost is

@@ -20,6 +20,7 @@
 //   node fleet_control.js verb start [--stagger=45000] [--min-gap=1500]   paced by first movement
 //   node fleet_control.js verb <start|stop|flush|wipe|...>
 //   node fleet_control.js verb sentry [--bot=X] [--kit=T-1]   the watch armed; --kit makes the body a terminator
+//   node fleet_control.js verb sentry --bot=X --kit=G-1 --post=x,y,z --face=x,y,z   a gladiator holding that post
 //   node fleet_control.js down [--keep-server]
 //
 // Exit codes: 0 ok · 1 the requested operation could not be completed.
@@ -397,6 +398,15 @@ async function playersOnline() {
 }
 
 // Delivers one operator verb to the foreman over its 'operator_command' pathway (Law 16).
+// sentryArgs() → the sentry verb's own inputs: --kit=<designation>, and a gladiator's post, --post=<x,y,z> (the feet cell it
+// holds) with --face=<x,y,z> (the cell it bows toward). A malformed cell is refused here, before anything is sent.
+function sentryArgs() {
+  const cell = (name) => { const v = opt(name); if (!v) return null; const [x, y, z] = String(v).split(',').map(Number); if (![x, y, z].every(Number.isFinite)) { console.error(`verb: --${name}=${v} is not x,y,z.`); process.exit(2); } return { x, y, z }; };
+  const stand = cell('post'), face = cell('face');
+  if (!!stand !== !!face) { console.error('verb: a post needs both --post=<x,y,z> and --face=<x,y,z>.'); process.exit(2); }
+  return { ...(opt('kit') ? { kit: opt('kit') } : {}), ...(stand ? { post: { stand, face } } : {}) };
+}
+
 async function sendVerb(verb, args = {}) {
   const { OPERATOR_VERBS: VERBS } = require(paths.bot('foreman/message_schema'));   // one vocabulary, three processes (Law 16)
   if (!VERBS.has(verb)) {
@@ -895,7 +905,7 @@ async function worldSpawn(worldName) {
       ? startStaggered()
       : sendVerb(positional[0], positional[0].startsWith('camera-')
         ? { number: opt('number') || positional[1], seat: opt('seat') }
-        : { ...(opt('bot') ? { bot: opt('bot') } : {}), ...(positional[0] === 'sentry' && opt('kit') ? { kit: opt('kit') } : {}) }),
+        : { ...(opt('bot') ? { bot: opt('bot') } : {}), ...(positional[0] === 'sentry' ? sentryArgs() : {}) }),
     // Cold and offline; pairing this with a world restore is enforced by the caller that owns both
     // halves, since only it knows which world is being restored.
     'memory-wipe': () => wipeMemory(),

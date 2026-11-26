@@ -57,6 +57,24 @@ const {
 } = require('./lanista_shared');
 // The bot's combat record has exactly one reader; this is it (Law 16).
 const combatLens = require('../../monitoring/combat_lens');
+// THE SHOW'S CUES: one row per moment the crowd's sound follows (show open, release, each gate, a battle's end, a banner,
+// the TNT, the recording, the champion or the fall, the shutdown), in fleet_logs/show_cues/show_<start>.jsonl. Written only by
+// an emperor's show; read only by Auren_Workshop/monitoring/show_cues_lens (trace_monitor --show-cues), which turns it
+// into the crowd's sound sheet. A row that cannot be written is said, and the show goes on.
+let showCueFile = null;
+function openShowCues() {
+  const dir = require('../workshop_paths').fleetLogs('show_cues');
+  require('fs').mkdirSync(dir, { recursive: true });
+  showCueFile = require('path').join(dir, `show_${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`);
+  showCue('show_open');
+  return showCueFile;
+}
+function showCue(cue, fields = {}) {
+  if (!showCueFile) return;
+  const w = require('@utils/external_library_guard').guardExternalSync('lanista', 'write a show cue',
+    () => require('fs').appendFileSync(showCueFile, `${JSON.stringify({ t: Date.now(), cue, ...fields })}\n`));
+  if (!w.ok) log('cues', `⚠ the cue '${cue}' was not written: ${w.reason}`);
+}
 // The filmed show's rounds, the emperor's controls and the TNT (the colosseum, arena_set).
 const crowdShow = require('./arena_show');
 // The show's people (crowd, guards, ruler) are not the bot's and do not ship: the module the workstation file names, or null.
@@ -113,15 +131,21 @@ function parseArgs(argv) {
       case 'crowd': a.crowd = v === undefined ? 10 : parseInt(v, 10); break; // spectator puppets on the set's row, see NPC_bot
       case 'guard': a.guard = true; break;              // two armoured guards either side of the throne, see NPC_bot
       case 'ruler': a.ruler = true; break;              // ArchitectBot on the throne in gold armour, see NPC_bot
+      case 'gladiator': a.gladiator = true; break;      // the body is a G: it walks onto the stand itself, see gladiatorToPost
       case 'board': a.board = v === undefined ? true : parseInt(v, 10); a.emperor = true; break; // the When Board, see when_board
       case 'tnt': a.tnt = parseInt(v, 10); break;       // how many TNT the board's drop lets fall (default TNT_DEFAULT)
+      case 'auto': a.auto = true; break;                // after the first release every round releases itself, see AUTO_STAGE_MS
+      case 'fall-tnt': a.fallTnt = true; break;         // the body's fall brings the TNT down as the crowd raises red
+      case 'take': a.take = v === undefined ? TAKE_INTRO_S : parseFloat(v); a.auto = true; break; // the show films itself, see THE TIMED TAKE
       default: break;
     }
   }
   // A round is always a list of (mob, count, hand) groups (Law 16). --wave wins over the single-mob dials.
   // `--show`: the run's species are the show's, one of each, so the checks made before the rounds (daylight) read them.
+  // `--show=book` reads the species from the saved wave book (the board may change them; the set's roof keeps the sun off).
   const show = a.show && crowdShow.SHOWS[a.show];
   if (!a.wave && show) a.wave = [...new Set(show.flatMap(r => parseWave(r.wave).map(g => g.mob)))].map(mob => ({ mob, count: 1 }));
+  if (!a.wave && a.show === 'book') a.wave = [...new Set(crowdShow.readBook().rounds.flatMap(r => r.groups.map(g => g.mob)))].map(mob => ({ mob, count: 1 }));
   if (!a.wave) a.wave = [{ mob: a.mob, count: a.count, hand: a.hand }];
   return a;
 }
@@ -400,7 +424,8 @@ function readBiome(scout, cell) {
 // The field: every mob this tool put in the world (by `ARENA_TAG`), and its health. `tag` narrows it to one arena of
 // several (colosseum: one tag per body), every one of which also carries ARENA_TAG.
 async function readArenaMobs(rcon, tag = ARENA_TAG) {
-  const reply = (await rcon.command(`execute as @e[tag=${tag}] run data get entity @s Health`) || '').trim();
+  // A mount that does not fight (arena_show MOUNT_TAG) is not in the field: the round ends when its riders are dead.
+  const reply = (await rcon.command(`execute as @e[tag=${tag},tag=!${crowdShow.MOUNT_TAG}] run data get entity @s Health`) || '').trim();
   const healths = [...reply.matchAll(/entity data:\s*(-?\d+(?:\.\d+)?)f/g)].map(m => parseFloat(m[1]));
   return { count: healths.length, totalHealth: healths.reduce((a, b) => a + b, 0), healths };
 }
@@ -610,19 +635,31 @@ function equipmentNbt(hand) {
 
 // ── A SUMMONED MOB ARRIVES WITH NOTHING ─────────────────────────────────────────────────────────────
 // `/summon` produces a mob with NO equipment. `--hand` is READ BACK, never trusted (Law 23).
+// A board mob (arena_show BOOK_MOBS) may be another entity, carry its own fields and ride a mount: the mount is summoned
+// with the mob as its passenger, both tagged, the mount marked MOUNT_TAG unless it fights.
 async function summonAt(rcon, mob, cell, hand, extraNbt = '', tag = null) {
-  const nbt = `{PersistenceRequired:1b,Tags:["${ARENA_TAG}"${tag ? `,"${tag}"` : ''}]${hand ? equipmentNbt(hand) : ''}${extraNbt}}`;
-  const reply = (await rcon.command(`summon minecraft:${mob} ${cell.x + 0.5} ${cell.y} ${cell.z + 0.5} ${nbt}`) || '').trim();
-  const ok = !/failed|error|unknown|incorrect/i.test(reply);
+  const spec = crowdShow.BOOK_MOBS[mob] || {};
+  const id = spec.id || mob;
+  const tags = (more) => `Tags:["${ARENA_TAG}"${tag ? `,"${tag}"` : ''}${more ? `,"${more}"` : ''}]`;
+  const own = `PersistenceRequired:1b,${tags(null)}${hand ? equipmentNbt(hand) : ''}${spec.nbt ? `,${spec.nbt}` : ''}${extraNbt}`;
+  const m = spec.mount;
+  const command = m
+    ? `summon minecraft:${m.id} ${cell.x + 0.5} ${cell.y} ${cell.z + 0.5} {PersistenceRequired:1b,${tags(m.fights ? null : crowdShow.MOUNT_TAG)}${m.nbt ? `,${m.nbt}` : ''}${extraNbt},Passengers:[{id:"minecraft:${id}",${own}}]}`
+    : `summon minecraft:${id} ${cell.x + 0.5} ${cell.y} ${cell.z + 0.5} {${own}}`;
+  const reply = (await rcon.command(command) || '').trim();
+  const ok = !/failed|error|unknown|incorrect|expected/i.test(reply);
 
   let armed = null, held = null;
   if (ok && hand) {
     // Matched on the mob nearest this cell, since every arena mob shares one tag.
-    held = (await rcon.command(`data get entity @e[tag=${tag || ARENA_TAG},type=${mob},limit=1,sort=nearest,x=${cell.x + 0.5},y=${cell.y},z=${cell.z + 0.5}] equipment`) || '').trim();
+    held = (await rcon.command(`data get entity @e[tag=${tag || ARENA_TAG},type=${id},limit=1,sort=nearest,x=${cell.x + 0.5},y=${cell.y},z=${cell.z + 0.5}] equipment`) || '').trim();
     armed = held.includes(hand.replace(/^minecraft:/, ''));
   }
   return { ok, reply, armed, held };
 }
+
+// gateTag(name) → the tag a colosseum mob carries for the gate whose pen it is staged in, so that gate's pen wakes alone.
+const gateTag = (name) => `arena_gate_${name}`;
 
 async function clearArena(rcon, tag = ARENA_TAG) {
   return rcon.command(`kill @e[tag=${tag}]`);
@@ -819,7 +856,9 @@ async function awaitStandingWatch(botName, waitMs = WATCH_WAIT_MS) {
 // read as an exchange of damage off the server, never proximity or the bot's own claim (Law 26).
 // `stallMs = 0` disables it.
 const REPORT_WAIT_MS = 12000;
-async function observeFight(rcon, botName, ceilingMs, stallMs = 0, buddyNames = [], striker = false) {
+const GATE_REPORT_GRACE_MS = 8000;
+// reportFrom: when given, () → the moment the bot's own report starts to count, or null while it cannot yet end the wave.
+async function observeFight(rcon, botName, ceilingMs, stallMs = 0, buddyNames = [], striker = false, reportFrom = null) {
   // Counts deaths IN THIS ROUND.
   await ensureDeathCounter(rcon);
   await rcon.command(`scoreboard players set ${botName} ${DEATH_OBJECTIVE} 0`);
@@ -837,7 +876,7 @@ async function observeFight(rcon, botName, ceilingMs, stallMs = 0, buddyNames = 
   // stall window's close.
   let engagedAt = null, stalled = false;
   // The bot's own report of a finished battle, read through the lens.
-  let reportedBattle = null;
+  let reportedBattle = null, reportHeldAt = null, reportHeldFor = null;
   // Reads the bot's own watcher trace.
   const traceReadable = !striker && combatLens.readBotTrace(botName) !== null;
   if (!traceReadable && !striker) {
@@ -881,9 +920,20 @@ async function observeFight(rcon, botName, ceilingMs, stallMs = 0, buddyNames = 
     if (field.count === 0 && Date.now() - t0 > 3000) { fieldCleared = true; break; }
     // THE BOT'S OWN REPORT, checked LAST — the observation outranks the claim (Law 26). With more bodies the fight is
     // over when the field empties or the first body dies, not when one of them reports its own wave closed.
-    if (traceReadable && !buddies.length) {
-      const reported = combatLens.completedBattlesSince(t0, { bot: botName });
-      if (reported.length) { reportedBattle = reported[reported.length - 1]; break; }
+    const reportAt = reportFrom ? reportFrom() : t0;
+    if (traceReadable && !buddies.length && reportAt !== null) {
+      const reported = combatLens.completedBattlesSince(reportAt, { bot: botName });
+      // Behind gates (`reportFrom`), the body can close a battle on the mob it just killed while the mob the last gate
+      // let out is still walking toward it. Its report ends the wave only once the field has stood unemptied for
+      // GATE_REPORT_GRACE_MS with no newer report and no fight open on the body (the lens's watch state): a wave is
+      // never cleared from under a body that is fighting. A field that empties first ends the wave as cleared.
+      if (reported.length) {
+        const latest = reported[reported.length - 1];
+        if (!reportFrom) { reportedBattle = latest; break; }
+        const watch = combatLens.watchState(botName);
+        if (reportHeldAt === null || latest.at !== reportHeldFor || (watch && watch.engaged)) { reportHeldAt = Date.now(); reportHeldFor = latest.at; }
+        if (Date.now() - reportHeldAt >= GATE_REPORT_GRACE_MS) { reportedBattle = latest; break; }
+      }
     }
     await sleep(400);
   }
@@ -961,6 +1011,40 @@ async function watchAfter(rcon, botName, seconds, deathsBefore) {
 // ── standBot — GET THE BODY ONTO THE SPOT AND THE EYES ONTO THE BODY. Everything before a summon. ────
 // Spawn, teleport to spot, spawn monster, in that order (Law 16). Returns `{ ok:false, reason }` in the
 // vocabulary runWave reports NOT RUN in.
+// A GLADIATOR WALKS ITSELF ONTO THE STAND (`--gladiator`; custom_api/gladiator holds the post the sentry verb gave it).
+// Lanista only waits for it there. A body outside the arena (its first entry, or back from a respawn) is put on the stand
+// once, as every body is.
+// Ready means on the stand AND bowing, as the server reads the crouch. Only then do the gates close and the wave is summoned,
+// so the body is inside the bars, never in a pen, when a staged mob exists.
+const GATE_SETTLE_MS = 1000;
+// `--auto`: how long a staged wave stands behind the bars before it releases itself (the beat that shows it waiting), and
+// how long past the verdict banner's cheer (crowd CHEER_MS) the next round waits, so the crowd has finished with its flag.
+const AUTO_STAGE_MS = 2000;
+const AUTO_AFTER_CHEER_MS = 1000;
+const GLADIATOR_ARENA_R = 16;
+const GLADIATOR_POST_WAIT_MS = 30000;
+async function gladiatorToPost(rcon, botName, cell, label) {
+  const off = (v) => (v.known && v.position ? Math.hypot(v.position.x - (cell.x + 0.5), v.position.z - (cell.z + 0.5)) : Infinity);
+  const first = await readBotVitals(rcon, botName);
+  if (off(first) > GLADIATOR_ARENA_R) return placeBot(rcon, botName, cell);
+  const t0 = Date.now();
+  for (let v = first; Date.now() - t0 < GLADIATOR_POST_WAIT_MS; v = await readBotVitals(rcon, botName)) {
+    if (off(v) <= 1.5 && await bowing(rcon, botName)) {
+      log(label, `  the gladiator is bowing on the stand, walked there itself (${Math.round((Date.now() - t0) / 1000)}s).`);
+      return { ok: true };
+    }
+    await sleep(500);
+  }
+  return { ok: false, why: `the gladiator was not bowing on the stand ${fmt(cell)} in ${GLADIATOR_POST_WAIT_MS / 1000}s; it walks there itself on the post its sentry verb gave it (--post, --face)` };
+}
+
+// bowing(rcon, botName) → true when the server reads the body crouched (the gladiator's bow).
+async function bowing(rcon, botName) {
+  const r = await rcon.command(`execute as ${botName} if predicate {condition:"minecraft:entity_properties",entity:"this",predicate:{flags:{is_sneaking:true}}}`);
+  return /passed/i.test(r || '');
+}
+
+
 async function standBot(scout, rcon, args, label) {
   // FIRST, BEFORE ANYTHING TOUCHES THE BODY.
   // A striker has no watch: lanista raised it and it fights only while a round is open.
@@ -969,8 +1053,8 @@ async function standBot(scout, rcon, args, label) {
   if (watch.waitedMs > 1000) log(label, `  the watch is standing (waited ${Math.round(watch.waitedMs / 1000)}s for the body to come free).`);
 
   if (args.at) {
-    const put = await placeBot(rcon, args.bot, args.at);
-    if (!put.ok) return { ok: false, reason: put.why, cause: 'terrain' };
+    const put = args.gladiator ? await gladiatorToPost(rcon, args.bot, args.at, label) : await placeBot(rcon, args.bot, args.at);
+    if (!put.ok) return { ok: false, reason: put.why, cause: args.gladiator ? 'bot' : 'terrain' };
   }
 
   const at = await readBotVitals(rcon, args.bot);
@@ -1030,7 +1114,7 @@ function showCues(rcon, args) {
   // What the crowd holds, read off the puppets' own hands (the lever in the box and the round's verdict move them too).
   const held = () => {
     const hands = (args.crowdBody || []).map(p => (p.bot.heldItem ? p.bot.heldItem.name : null));
-    const up = hands.filter(h => h === 'green_banner').length, down = hands.filter(h => h === 'red_banner').length;
+    const up = hands.filter(h => h === 'lime_banner').length, down = hands.filter(h => h === 'red_banner').length;
     return up + down === 0 ? null : up >= down ? 'up' : 'down';
   };
   const recorderFile = require('@utils/workstation').findRecorder();
@@ -1040,6 +1124,8 @@ function showCues(rcon, args) {
       { cwd: require('path').resolve(__dirname, '..', '..', '..'), windowsHide: true, maxBuffer: 1 << 24 },
       (err, stdout) => resolve({ ok: !err, said: String(stdout || '').trim().split('\n').pop() }));
   });
+  // The timed take (`--take`) rolls and cuts through the same calls and keeps the board's recording light true.
+  args.recorder = recorderFile ? { call: recorderCall, rolling: (on) => { recording = on; } } : null;
   if (recorderFile) {
     const look = () => recorderCall('isRunning').then(r => { obsUp = r.said.endsWith('true'); });
     look();
@@ -1051,7 +1137,8 @@ function showCues(rcon, args) {
   const verdict = (k) => () => emperor.press(k);
   return [
     { id: 'release', label: 'Release', group: 'The show',
-      read: () => (emperor.waiting() === 'wave' ? { state: 'on', words: 'a wave is staged: press to let it out' }
+      read: () => (emperor.waiting() === 'stage' ? { state: 'on', words: 'wave 0: press to stage the first wave behind the gates' }
+        : emperor.waiting() === 'wave' ? { state: 'on', words: 'a wave is staged: press to let it out' }
         : emperor.waiting() === 'dismiss' ? { state: 'on', words: 'the show is over: press to dismiss the crowd' }
           : { state: 'idle', words: 'nothing staged yet' }),
       fire: () => emperor.press('release') },
@@ -1063,17 +1150,74 @@ function showCues(rcon, args) {
       fire: verdict('down') },
     { id: 'lower', label: 'Lower banners', group: 'The crowd',
       read: () => (!args.crowdBody ? { state: 'unavailable', words: 'no crowd (add --crowd)' } : held() ? { state: 'on', words: `${held() === 'up' ? 'green' : 'red'} is up: press to lower` } : { state: 'idle', words: 'hands are empty' }),
-      fire: async () => { await npcModule().crowdHolds(rcon, null); return 'banners lowered'; } },
+      fire: async () => { showCue('banner_lower'); await npcModule().crowdHolds(rcon, null); return 'banners lowered'; } },
     { id: 'tnt', label: 'Drop the TNT', group: 'The ceiling', confirm: true,
       read: () => (tntDropped ? { state: 'on', words: `${tntDropped} dropped: the set needs placing again after this show` } : { state: 'off', words: `${args.tnt || TNT_DEFAULT} lit TNT from the awning (press twice)` }),
-      fire: async () => { const r = await crowdShow.dropTnt(rcon, args.arenaSet.stand, args.tnt || TNT_DEFAULT); tntDropped += r.summoned; return `${r.summoned} summoned, ${r.read == null ? 'some' : r.read} falling`; } },
+      fire: async () => { showCue('tnt'); const r = await crowdShow.dropTnt(rcon, args.arenaSet.stand, args.tnt || TNT_DEFAULT); tntDropped += r.summoned; return `${r.summoned} summoned, ${r.read == null ? 'some' : r.read} falling`; } },
+    { id: 'shutdown', label: 'Shut everything down', group: 'The seat', confirm: true,
+      read: () => ({ state: 'off', words: 'the fleet, the server and the cameras off; the show ends (press twice)' }),
+      fire: async () => { showCue('shutdown'); log('board', 'SHUT DOWN pressed: the fleet, the server and the cameras come down'); setTimeout(shutEverything, 200); return 'shutting everything down'; } },
     { id: 'record-start', label: 'Start recording', group: 'Recording',
       read: () => recReady() || (recording ? { state: 'on', words: 'recording' } : { state: 'off', words: 'not recording' }),
-      fire: async () => { const r = await recorderCall('roll'); recording = recording || r.said.endsWith('true'); return r.said.endsWith('true') ? 'rolling: every camera writing' : 'OBS did not confirm every camera writing'; } },
+      fire: async () => { const r = await recorderCall('roll'); if (r.said.endsWith('true')) showCue('recording_start'); recording = recording || r.said.endsWith('true'); return r.said.endsWith('true') ? 'rolling: every camera writing' : 'OBS did not confirm every camera writing'; } },
     { id: 'record-stop', label: 'Stop recording', group: 'Recording', confirm: true,
       read: () => recReady() || (recording ? { state: 'on', words: 'press twice to cut and save the take' } : { state: 'idle', words: 'not recording' }),
-      fire: async () => { const r = await recorderCall('cut'); recording = false; return r.said.endsWith('true') ? 'cut, and the take is saved' : 'stopped; the take was not saved, see the show terminal'; } },
+      fire: async () => { const r = await recorderCall('cut'); showCue('recording_stop'); recording = false; return r.said.endsWith('true') ? 'cut, and the take is saved' : 'stopped; the take was not saved, see the show terminal'; } },
   ];
+}
+
+// ── THE TIMED TAKE (`--take[=<intro seconds>]`) ─────────────────────────────────────────────────────
+// The show films itself, nobody pressing anything. The first round is staged behind the gates with no wave-0 release; every
+// camera then starts recording, that round is released `take` seconds after the recording began (the spoken intro's length),
+// the book runs back to back (`--take` sets `--auto`), and the recording is cut and wrapped TAKE_AFTER_BLAST_MS after the
+// last TNT has gone off (the body fell), or TAKE_AFTER_CHAMPION_MS after the last round's cheer (it stood). The show
+// then ends without waiting to be dismissed. A recording that does not start releases nothing.
+const TAKE_INTRO_S = 14;
+const TAKE_AFTER_BLAST_MS = 6000;      // the smoke, the crater and the drops settling, after the last blast
+const TAKE_AFTER_CHAMPION_MS = 3000;   // the standing body, after the crowd's last cheer has been put away
+const TAKE_BLAST_WAIT_MS = 20000;      // the longest the cut waits for the TNT to be gone before it counts the tail (Law 8)
+// The take's state belongs to the show, not to a round: each round runs on its own copy of the arguments.
+const take = { rolled: false, rolling: false };
+
+// takeRoll(args) → { ok, startedAt } | { ok:false, why }. `startedAt` is when the camera files began (the recorder's
+// own reading), or the moment the roll was confirmed where the recorder cannot say.
+async function takeRoll(args) {
+  if (!args.recorder) return { ok: false, why: 'no recorder on this machine (workstation.findRecorder), or no board (--board)' };
+  const asked = Date.now();
+  const r = await args.recorder.call('roll');
+  if (!r.said.endsWith('true')) return { ok: false, why: 'OBS did not confirm every camera writing' };
+  args.recorder.rolling(true);
+  take.rolling = true;
+  const began = Number((await args.recorder.call('rolledAt')).said);
+  const sensed = Number.isFinite(began) && began >= asked - 1000;
+  // The cue carries the moment the camera files began, so the cue sheet's clock is the footage's clock.
+  showCue('recording_start', { by: 'take', ...(sensed ? { t: began } : {}) });
+  if (!sensed) log('take', '  ⚠ the recorder could not say when the camera files began; the intro is counted from the confirmed roll, so the footage holds a few seconds more before the release');
+  return { ok: true, startedAt: sensed ? began : Date.now() };
+}
+
+// takeCut(args, why) — stop the recording and wrap the take. Runs once; later calls find nothing rolling.
+async function takeCut(args, why) {
+  if (!take.rolling) return;
+  take.rolling = false;
+  const r = await args.recorder.call('cut');
+  args.recorder.rolling(false);
+  showCue('recording_stop', { by: 'take', why });
+  log('take', r.said.endsWith('true') ? `cut (${why}); the take is wrapped into its own folder` : `⚠ stopped (${why}); the take was NOT wrapped here: the teardown's wrap finds the loose camera files`);
+}
+
+// shutEverything() — the board's Shut down: the fleet and its server (fleet_control down, which stops the world saved) and
+// the camera crew (start_cameras -Down), each through its owner. The show then ends on its lost console, as it does
+// whenever the server goes; a bench that raised it (colosseum_show) takes the seat down after, finding it already down.
+function shutEverything() {
+  const { spawn } = require('child_process');
+  const path = require('path');
+  const bot = path.resolve(__dirname, '..', '..');
+  spawn(process.execPath, [path.join(bot, 'Auren_Workshop', 'fleet_control.js'), 'down'], { cwd: bot, stdio: 'ignore', windowsHide: true });
+  if (process.platform === 'win32') {
+    spawn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(bot, 'Auren_Workshop', 'scripts', 'start_cameras.ps1'), '-Down'],
+      { cwd: bot, stdio: 'ignore', windowsHide: true });
+  }
 }
 
 // ── ARENA SET: the filming set (arena_set) instead of sited ground ──────────────────────────────────
@@ -1081,7 +1225,7 @@ function showCues(rcon, args) {
 // gate pens, one cell from each pen in turn. The set's design is the one source of where those are (Law 16). The set
 // is read back before it is trusted: a rollback puts back a world without it, and the book would still name it.
 const ARENA_STAGE_SEC = 6;
-// Mobs that burn under open sky by day. The set's oculus is open sky over the centre of the sand.
+// Mobs that burn under open sky by day.
 const SUN_BURNS = new Set(['zombie', 'skeleton', 'stray', 'drowned', 'zombie_villager', 'phantom', 'bogged']);
 async function openSet(rcon, args) {
   const set = require('./arena_set');
@@ -1113,7 +1257,10 @@ async function openSet(rcon, args) {
     guards: d.points.guards.map(at),
     throne: at(d.points.emperor),
     sited: { cells, botCell: stand, band: 0, refused: 0, pool: cells.length, originDistance: 0, anchorsTried: 0, arenaSite: { tags: ['colosseum'], notes: `the filming set centred on ${fmt(center)}` } },
-    gates: open => set.setGates(rcon, center, open),
+    gates: (open, only = null) => set.setGates(rcon, center, open, only),
+    penPerGate: Math.min(...pens.map(p => p.length)),
+    clearDrops: () => set.clearDrops(rcon, center),
+    applyCameras: () => set.applyCameras(rcon, center),
     restore: () => rcon.command(`gamerule mob_griefing ${griefingBefore}`),
   };
 }
@@ -1192,8 +1339,9 @@ async function runWave(scout, rcon, args, n) {
       reason: `the control is polluted — ${wildBefore.named.join(', ')} still within ${WILD_CHECK_RADIUS}b of ${fmt(cell)} after the purge (nothing was summoned)` };
   }
 
-  // ARENA SET: the gates are shut before anything is summoned, so the wave is staged behind the bars.
-  if (args.arenaSet) await args.arenaSet.gates(false);
+  // ARENA SET: the gates are shut before anything is summoned, so the wave is staged behind the bars, and the summon waits
+  // GATE_SETTLE_MS more so every client holds the shut gate before a mob exists behind it.
+  if (args.arenaSet) { await args.arenaSet.gates(false); await sleep(GATE_SETTLE_MS); }
 
   // The sited cells are spent IN ORDER across the groups, spread across the same bearings a single-species
   // wave would use.
@@ -1202,6 +1350,10 @@ async function runWave(scout, rcon, args, n) {
   const stacked = new Map();   // cell key → how many mobs have already been summoned onto it
   const anger = args.provoke ? await angerNbt(rcon, args.bot) : '';
   let next = 0;
+  // ARENA SET: the pens by gate (each sited cell knows its gate), and where each pen and the round's spread have reached.
+  const penOf = args.arenaSet ? crowdShow.GATE_NAMES.map((_, gi) => sited.cells.filter(c => c.gate === gi)) : null;
+  const penNext = crowdShow.GATE_NAMES.map(() => 0);
+  let spreadAt = 0;
   for (const g of wave) {
     // ── ONLY CELLS THE BOT CAN ACTUALLY SEE THIS MOB FROM ───────────────────────────────────────────
     // Filtered per species: `engageRangeFor` is architect_config's one route (Law 16). The filter measures
@@ -1219,7 +1371,10 @@ async function runWave(scout, rcon, args, n) {
     // In the set the pens are already in order, one cell from each gate in turn, so a wave comes from every side.
     const pool = args.arenaSet ? (inRange.length ? inRange : sited.cells.slice()) : (inRange.length ? inRange : sited.cells.slice()).sort(byGap);
     for (let i = 0; i < g.count; i++) {
-      const c = pool[next++ % pool.length];
+      // ARENA SET: each mob goes into its gate's pen: the group's own gate, or for 'spread' (and a wave with no gate) the
+      // next gate in turn across the whole round. The pen's cells are spent in order.
+      const gi = !args.arenaSet ? null : g.gate && g.gate !== 'spread' ? crowdShow.GATE_NAMES.indexOf(g.gate) : (spreadAt++ % crowdShow.GATE_NAMES.length);
+      const c = gi === null ? pool[next++ % pool.length] : penOf[gi][(penNext[gi]++) % penOf[gi].length];
       const key = `${c.x},${c.y},${c.z}`;
       const already = stacked.get(key) || 0;
       // Lets the first mob WALK OFF the cell before the second arrives.
@@ -1227,7 +1382,7 @@ async function runWave(scout, rcon, args, n) {
       stacked.set(key, already + 1);
       // ARENA SET: a staged mob is held still (NoAI) behind the bars. Left awake, it sees the body, fails to path through the
       // bars, and is still waiting out its failed path when the gates open, standing where it was summoned.
-      const r = await summonAt(rcon, g.mob, c, g.hand, anger + (args.arenaSet ? ',NoAI:1b' : ''));
+      const r = await summonAt(rcon, g.mob, c, g.hand, anger + (args.arenaSet ? ',NoAI:1b' : ''), gi === null ? null : gateTag(crowdShow.GATE_NAMES[gi]));
       // The 3-D gap, matching the presence gate's own measure.
       if (r.ok) placed.push({ mob: g.mob, cell: c, distance: round2(gapTo(c)), armed: r.armed });
       // A mob asked to carry something and not carrying it is a DIFFERENT OPPONENT (Law 25).
@@ -1285,41 +1440,66 @@ async function runWave(scout, rcon, args, n) {
   if (args.arenaSet) {
     // `--emperor`: the wave stands staged until the emperor presses the release button; otherwise for --stage seconds.
     if (args.emperorConsole) {
-      log('round', '  staged behind the gates, waiting for the emperor to release it');
-      if (!await args.emperorConsole.awaitRelease()) {
+      // `--auto`: the emperor's one release (wave 0) starts the show, and each round then releases itself once it has
+      // stood staged AUTO_STAGE_MS. A commit on the board while it stands is read by the next staging.
+      log('round', args.take && !take.rolled ? '  staged behind the gates; released when the take\'s intro has run' : args.auto ? `  staged behind the gates; released in ${AUTO_STAGE_MS / 1000}s` : '  staged behind the gates, waiting for the emperor to release it');
+      // `--take`: the first round stands staged while every camera starts and the intro runs; the recording must be writing.
+      const opensTake = args.take && !take.rolled;
+      if (opensTake) {
+        take.rolled = true;
+        const roll = await takeRoll(args);
+        if (!roll.ok) {
+          await clearArena(rcon);
+          return { run: false, cause: 'take', reason: `the recording did not start: ${roll.why}; nothing was released`, biome };
+        }
+        const wait = roll.startedAt + args.take * 1000 - Date.now();
+        log('take', `  every camera is writing; the recording began ${((Date.now() - roll.startedAt) / 1000).toFixed(1)}s ago, round 1 is released ${args.take}s after it` +
+          (wait < 0 ? ` (⚠ ${(-wait / 1000).toFixed(1)}s late: the roll took longer than the intro)` : ''));
+        if (wait > 0) await sleep(wait);
+        log('take', `  released ${((Date.now() - roll.startedAt) / 1000).toFixed(2)}s into the recording`);
+      }
+      const released = opensTake ? true : args.auto ? (await sleep(AUTO_STAGE_MS), true) : await args.emperorConsole.awaitRelease();
+      // The board committed a new wave book while this round stood staged: it is cleared and staged again from the book.
+      if (released === 'restage') {
+        await clearArena(rcon);
+        return { run: false, cause: 'restage', reason: 'the wave book was committed while this round stood staged', biome };
+      }
+      if (released) showCue('release', { round: n });
+      if (!released) {
         await clearArena(rcon);
         return { run: false, cause: 'bench', reason: 'the emperor never pressed release; the staged wave was cleared', biome };
       }
       if (args.crowdBody) await npcModule().crowdHolds(rcon, null);
+      // The title is the wave's number only: what it holds is not on screen long enough to read and covers the sand.
       await rcon.command('title @a times 5 40 10');
-      await rcon.command(`title @a subtitle {"text":"${waveLabel(wave)}${args.trickleEvery ? `, one every ${args.trickleEvery}s` : ''}","color":"white"}`);
-      await rcon.command(`title @a title {"text":"ROUND ${n}","color":"gold"}`);
+      await rcon.command('title @a subtitle {"text":""}');
+      await rcon.command(`title @a title {"text":"WAVE ${n}","color":"gold"}`);
     } else {
       const stage = Number.isFinite(args.stage) ? args.stage : ARENA_STAGE_SEC;
       log('round', `  staged behind the gates for ${stage}s`);
       await sleep(stage * 1000);
     }
-    if (args.trickleEvery) {
-      // THE TRICKLE: the gates stay shut; the staged mobs are let out one at a time, `every` seconds apart, each through
-      // its own gate onto the sand at the gate's mouth and woken there. The cells were filled one per pen in turn, so
-      // the mobs come from the gates in turn. It stops the moment the fight ends.
-      trickle = { stop: false, out: 0 };
+    // The gates holding a mob, in the order they open.
+    const held = crowdShow.RELEASE_ORDER.filter(name => placed.some(p => crowdShow.GATE_NAMES[p.cell.gate] === name));
+    if (args.trickleEvery && held.length > 1) {
+      // THE GATES IN TURN: nothing is moved. Each gate's bars disappear, `every` seconds after the one before, and its pen
+      // wakes and walks out on its own. It stops the moment the fight ends.
+      trickle = { stop: false, out: 0, gates: held.length };
       trickle.done = (async () => {
-        for (const p of placed) {
+        for (const [k, name] of held.entries()) {
           if (trickle.stop) break;
-          const m = args.arenaSet.mouths[p.cell.gate];
-          const sel = `@e[tag=${ARENA_TAG},type=${p.mob},x=${p.cell.x + 0.5},y=${p.cell.y},z=${p.cell.z + 0.5},distance=..1,limit=1,sort=nearest]`;
-          await rcon.command(`execute as ${sel} run tp @s ${m.x + 0.5} ${m.y} ${m.z + 0.5}`);
-          await rcon.command(`execute as @e[tag=${ARENA_TAG},type=${p.mob},x=${m.x + 0.5},y=${m.y},z=${m.z + 0.5},distance=..1,limit=1,sort=nearest] run data merge entity @s {NoAI:0b}`);
-          await rcon.command(`playsound minecraft:block.iron_door.open block @a ${m.x} ${m.y} ${m.z} 2 0.6`);
-          await rcon.command(`particle minecraft:poof ${m.x + 0.5} ${m.y + 0.5} ${m.z + 0.5} 0.5 0.5 0.5 0.02 15`);
-          trickle.out++;
-          await sleep(args.trickleEvery * 1000);
+          await args.arenaSet.gates(true, [name]);
+          showCue('gate_open', { round: n, gate: name });
+          await rcon.command(`execute as @e[tag=${ARENA_TAG},tag=${gateTag(name)}] run data merge entity @s {NoAI:0b}`);
+          trickle.out += placed.filter(p => crowdShow.GATE_NAMES[p.cell.gate] === name).length;
+          if (k < held.length - 1) await sleep(args.trickleEvery * 1000);
         }
+        trickle.lastAt = Date.now();
       })();
-      log('round', `  trickle: ${placed.length} let out one every ${args.trickleEvery}s through the gates in turn`);
+      log('round', `  gates open one at a time, every ${args.trickleEvery}s: ${held.join(', ')}`);
     } else {
       await args.arenaSet.gates(true);
+      showCue('gate_open', { round: n, gate: 'all' });
       await rcon.command(`execute as @e[tag=${ARENA_TAG}] run data merge entity @s {NoAI:0b}`);
       log('round', '  gates open');
     }
@@ -1358,9 +1538,12 @@ async function runWave(scout, rcon, args, n) {
     return out;
   })() : null;
   // A trickle's fight lasts at least as long as the letting-out, so its ceiling is stretched by that time.
-  const ceilingMs = (args.ceilingSeconds + (trickle ? placed.length * args.trickleEvery : 0)) * 1000;
+  const ceilingMs = (args.ceilingSeconds + (trickle ? (trickle.gates - 1) * args.trickleEvery : 0)) * 1000;
+  // While a gate is still shut the bot's own report cannot end the wave: it closes its battle on the mobs it can see.
   const outcome = await observeFight(rcon, args.bot, ceilingMs,
-    (args.stallSeconds || 0) * 1000, args.buddies || [], !!args.strikerBody);
+    (args.stallSeconds || 0) * 1000, args.buddies || [], !!args.strikerBody,
+    trickle ? () => trickle.lastAt || null : null);
+  showCue('battle_end', { round: n, died: outcome.botDied, cleared: outcome.fieldCleared });
   if (follow) outcome.followed = await follow;
   if (trickle) { trickle.stop = true; await trickle.done; outcome.trickledOut = trickle.out; }
   // Whether the wave held a mob that blows up: only then can health lost after the field cleared be read as a blast.
@@ -1391,7 +1574,11 @@ async function runWave(scout, rcon, args, n) {
   }
   // Read again at the end: a wild hostile there now may have been in the fight, so the round is not a clean result.
   const wildAfter = await countWildHostiles(rcon, cell);
-  await clearArena(rcon);
+  // `--fall-tnt`: a fallen body's wave is left standing for the TNT the round loop drops on it.
+  const forTnt = args.fallTnt && args.arenaSet && outcome.botDied;
+  if (!forTnt) await clearArena(rcon);
+  // The colosseum is a stage: what the round dropped and the body left lying is wiped before the next round.
+  if (args.arenaSet && !forTnt) log('round', `  ${await args.arenaSet.clearDrops()}`);
   // Each body's own side of the fight, off its own trace, beside the server's numbers.
   const tallies = (args.buddies || []).length
     ? Object.fromEntries([args.bot, ...args.buddies].map((id) => [id, combatLens.fightTallySince(id, waveAt)]))
@@ -1555,8 +1742,9 @@ async function main() {
   const fit = rangeFitsAggro(args.wave, args.range);
   if (!fit.ok) { console.error(`Cannot run: ${fit.why}`); return 2; }
 
-  // A day fight with a mob the sun burns ends for a reason that is not the fight (Law 25): the oculus is open sky.
-  const burns = args.time && args.time !== WORLD.time && args.wave.concat(args.follow || []).filter(g => SUN_BURNS.has(g.mob));
+  // A day fight with a mob the sun burns ends for a reason that is not the fight (Law 25). The colosseum's velarium
+  // closes the bowl overhead (arena_set), so in the set no mob is under open sky.
+  const burns = args.time && args.time !== WORLD.time && !args.arena && args.wave.concat(args.follow || []).filter(g => SUN_BURNS.has(g.mob));
   if (burns && burns.length) { console.error(`Cannot run: ${burns.map(g => g.mob).join(', ')} burn in daylight, and --time=${args.time} is not night. Fight them at the default time.`); return 2; }
 
   const arenaLink = await openArena({ time: args.time || null });
@@ -1569,7 +1757,20 @@ async function main() {
     if (!set.ok) { console.error(`Cannot run: ${set.why}`); await arenaLink.close(); return 2; }
     args.arenaSet = set;
     args.at = set.stand;
-    if (args.show) {
+    log('arena', `the set before the show: ${await set.clearDrops()}`);
+    for (const line of await set.applyCameras()) log('arena', `the set's camera ${line}`);
+    if (args.gladiator) {
+      const c = (p) => `${p.x},${p.y},${p.z}`;
+      log('arena', `the gladiator's post: node Auren_Workshop/fleet_control.js verb sentry --bot=${args.bot} --kit=G-1 --post=${c(set.stand)} --face=${c(set.throne)}`);
+    }
+    if (args.show === 'book') {
+      // THE WAVE BOOK (arena_show): the emperor's saved rounds, edited on the board and read again before every round.
+      const book = crowdShow.checkBook(crowdShow.readBook(), set.penPerGate);
+      if (!book.ok) { console.error(`Cannot run: the wave book — ${book.why}`); await set.restore(); await arenaLink.close(); return 2; }
+      args.waveBook = true;
+      args.rounds = book.book.rounds.length;
+      log('arena', `the wave book: ${args.rounds} round(s), ${require('path').basename(crowdShow.WAVE_BOOK)}; edit it on the board`);
+    } else if (args.show) {
       const show = crowdShow.showRounds(args.show, set.sited.cells.length);
       if (!show.ok) { console.error(`Cannot run: ${show.why}`); await set.restore(); await arenaLink.close(); return 2; }
       args.showRounds = show.rounds;
@@ -1580,6 +1781,7 @@ async function main() {
       const ready = await emperor.check();
       if (!ready.ok) { console.error(`Cannot run: ${ready.why}`); await set.restore(); await arenaLink.close(); return 2; }
       args.emperorConsole = emperor;
+      log('cues', `the show's cues are written to ${openShowCues()}`);
       log('arena', `the emperor's controls stand at release ${fmt(emperor.controls.release)}, up ${fmt(emperor.controls.up)}, down ${fmt(emperor.controls.down)}`);
     }
     log('arena', `the colosseum centred on ${fmt(set.center)} — ${set.sited.cells.length} pen cell(s) behind four gates, ` +
@@ -1600,8 +1802,8 @@ async function main() {
       });
       if (!raised.ok) { log('crowd', `NOT RUN — ${raised.why}`); return 2; }
       args.crowdBody = raised.puppets;
-      log('crowd', `${raised.puppets.length} spectator(s) on the row (${raised.tagged == null ? 'tag count unread' : `${raised.tagged} tagged`}), each with its own habit: ` +
-        raised.puppets.map(p => `${p.username} ${p.habit}`).join(', '));
+      log('crowd', `${raised.puppets.length} spectator(s) on the row (${raised.tagged == null ? 'tag count unread' : `${raised.tagged} tagged`}), each on its own dice (favourite, usual gap): ` +
+        raised.puppets.map(p => `${p.username} ${p.habit}${p.paceMs ? ` ${(p.paceMs / 1000).toFixed(1)}s` : ''}`).join(', '));
     }
     if (args.guard) {
       const raised = await npcModule().raiseGuards(rcon, {
@@ -1627,6 +1829,7 @@ async function main() {
     if (args.emperorConsole) {
       args.emperorConsole.startLevers(async (k) => {
         log('emperor', `thumbs ${k}, the emperor's verdict`);
+        showCue('banner', { kind: k, by: 'emperor' });
         if (args.crowdBody) await npcModule().crowdHolds(rcon, k, args.crowdBody.map(p => p.username));
       });
     }
@@ -1634,8 +1837,22 @@ async function main() {
       args.whenBoard = require('./when_board').createWhenBoard({
         title: `The colosseum — ${args.bot}${args.show ? `, show '${args.show}'` : ''}`,
         cues: showCues(rcon, args), port: args.board === true ? undefined : args.board, log,
+        // `--show=book`: the board edits the wave book; a save is checked against the pens before it is kept.
+        editor: args.waveBook ? {
+          read: () => crowdShow.readBook(),
+          // A commit is used at once: a round standing staged is staged again from it; otherwise the next staging reads it.
+          write: (book) => {
+            const c = crowdShow.writeBook(book, args.arenaSet.penPerGate);
+            if (!c.ok) return c;
+            const again = args.emperorConsole && args.emperorConsole.restage();
+            return { ...c, used: again === 'wave' ? 'the staged round is staged again from it now'
+              : again === 'dismiss' ? 'a round past the last one fought is staged now' : 'the next round staged reads it' };
+          },
+          mobs: Object.keys(crowdShow.BOOK_MOBS), gates: crowdShow.RELEASE_ORDER, maxEvery: crowdShow.MAX_EVERY,
+        } : null,
       });
       if (!await args.whenBoard.ready) return 2;
+      require('./when_board').openPage(args.whenBoard.url, log);
     }
     if (args.kit) {
       const k = await kitBot(rcon, args.bot, args.kit);
@@ -1652,20 +1869,68 @@ async function main() {
     log('open', `${args.bot} is standing at ${fmt(opening.cell)} in ${opening.biome || 'an unread biome'}, ` +
       `the scout can read the ground, and the field is clear. Monsters next.`);
 
+    // WAVE 0: the emperor's first release brings the first wave behind the gates; nothing is summoned before it, so the show
+    // opens on an empty arena and the gladiator bowing. From there each round stages itself and waits for its release.
+    // `--take`: no release at all. The recorder must be up before anything is staged for it.
+    if (args.take) {
+      if (!args.recorder || !(await args.recorder.call('isRunning')).said.endsWith('true')) {
+        log('take', 'NOT RUN — OBS is not up, so the take could not be recorded (raise the show with record film, and --board)');
+        return 2;
+      }
+      log('take', `the show films itself: round 1 is staged now, every camera rolls, and round 1 is released ${args.take}s into the recording`);
+    } else if (args.emperorConsole) {
+      log('emperor', 'wave 0: the arena is empty; the first release stages round 1 behind the gates');
+      if (!await args.emperorConsole.awaitRelease('stage')) { log('emperor', 'the emperor never released wave 0; the show ends'); return 2; }
+    }
+
     const rounds = [];
-    for (let n = 1; n <= args.rounds; n++) {
+    // `ended`: the show stops for good (the body fell, an unfit body, an unreadable book); otherwise the rounds ran out and
+    // the emperor's wait below may find more in the book.
+    let n = 1, ended = false;
+    for (;;) {
+    for (; n <= args.rounds; n++) {
       // `--show`: round n is the show's n-th round. `--escalate`: round n fights n× every group of the wave.
-      const step = args.showRounds ? args.showRounds[n - 1] : null;
-      const r = await runWave(scout, rcon, step ? { ...args, wave: parseWave(step.wave), trickleEvery: step.every || null }
+      // `--show=book`: the book is read again here, so the round edited on the board since the last one is the one fought.
+      let step = args.showRounds ? args.showRounds[n - 1] : null;
+      if (args.waveBook) {
+        const book = crowdShow.checkBook(crowdShow.readBook(), args.arenaSet.penPerGate);
+        if (!book.ok) { log('round', `${n}: NOT RUN — the wave book: ${book.why}`); exitCode = 2; ended = true; break; }
+        args.rounds = book.book.rounds.length;
+        if (n > args.rounds) break;
+        step = crowdShow.bookRound(book.book.rounds[n - 1]);
+      }
+      const r = await runWave(scout, rcon, step ? { ...args, wave: typeof step.wave === 'string' ? parseWave(step.wave) : step.wave, trickleEvery: step.every || null }
         : args.escalate ? { ...args, wave: args.wave.map(g => ({ ...g, count: g.count * n })) } : args, n);
+      if (r.cause === 'restage') { log('round', `${n}: the wave book was committed; round ${n} is staged again from it`); n--; continue; }
       // The round's own verdict goes up on the crowd's banners unless the emperor gives his: cleared → up, fallen → down.
-      if (r.run && args.crowdBody) await npcModule().crowdHolds(rcon, r.botDied ? 'down' : 'up', args.crowdBody.map(p => p.username));
+      if (r.run && args.crowdBody) {
+        showCue('banner', { kind: r.botDied ? 'down' : 'up', by: 'round', round: n });
+        const banners = npcModule().crowdHolds(rcon, r.botDied ? 'down' : 'up', args.crowdBody.map(p => p.username));
+        // `--fall-tnt`: the TNT comes down on the fallen body's wave while the red banners go up.
+        if (r.botDied && args.fallTnt) {
+          showCue('tnt', { round: n });
+          const t = await crowdShow.dropTnt(rcon, args.arenaSet.stand, args.tnt || TNT_DEFAULT);
+          log('emperor', `the body fell: ${t.summoned} TNT from the awning, ${t.read == null ? 'some' : t.read} falling, as the crowd raises red`);
+        }
+        await banners;
+        // `--take`: the cut follows the last blast, so the take holds what the TNT left.
+        if (r.botDied && args.fallTnt && args.take) {
+          const t0 = Date.now();
+          while (Date.now() - t0 < TAKE_BLAST_WAIT_MS && /passed|count/i.test((await rcon.command('execute if entity @e[type=minecraft:tnt]')) || '')) await sleep(250);
+          log('take', `the last TNT went off ${((Date.now() - t0) / 1000).toFixed(1)}s after the banners; cutting in ${TAKE_AFTER_BLAST_MS / 1000}s`);
+          await sleep(TAKE_AFTER_BLAST_MS);
+          await takeCut(args, 'after the TNT');
+        }
+        // `--auto`: the crowd finishes its cheer and puts its banners away before the next round is staged.
+        if (args.auto && !r.botDied) await sleep(npcModule().CHEER_MS + AUTO_AFTER_CHEER_MS);
+      }
       rounds.push(r);
       if (!r.run) {
         log('round', `${n}: NOT RUN — ${r.reason}`);
         exitCode = 2;
         // A body unfit to fight stays unfit: the next round would spend its whole watch wait to hear the same refusal.
-        if (r.cause === 'bot') { log('round', `stopping: ${args.rounds - n} round(s) left unrun.`); break; }
+        // A take that did not start recording is not fought unfilmed.
+        if (r.cause === 'bot' || r.cause === 'take') { log('round', `stopping: ${args.rounds - n} round(s) left unrun.`); ended = true; break; }
         continue;
       }
       log('round', `  → ${headline(r)} · bot hp ${r.hpStart}→${r.hpEnd} (low ${r.minHp}) · ` +
@@ -1703,17 +1968,39 @@ async function main() {
           `${r.heldWaves.map(w => `${w.outcome}@${w.rel}s`).join(', ') || 'none'} · bot hp at the end ${r.hpAfterHold}`);
       }
       // `--escalate` is one life: the round the body falls is the last.
-      if ((args.escalate || args.showRounds) && r.botDied) { log('round', `the body fell in round ${n}; ${args.rounds - n} round(s) left unrun.`); break; }
+      if ((args.escalate || args.showRounds || args.waveBook) && r.botDied) { showCue('fallen', { round: n }); log('round', `the body fell in round ${n}; ${args.rounds - n} round(s) left unrun.`); ended = true; break; }
       if (n < args.rounds) await sleep(2000);
     }
-    // THE CROWD HOLDS ITS LAST VERDICT until the emperor dismisses it with one more press of the release button, so the
-    // closing shot (the fall and the banners) is there for as long as he needs it.
-    if (args.crowdBody && args.emperorConsole) {
-      log('emperor', 'the show is over; the crowd holds its verdict until the emperor presses release to dismiss it');
-      await sleep(1500);   // the last press must have sprung back before the next one counts
-      if (!await args.emperorConsole.awaitRelease('dismiss')) log('emperor', 'the emperor never dismissed the crowd; it leaves now');
+    const fought = rounds.filter(r => r.run);
+    if (args.emperorConsole && fought.length && !ended && !fought[fought.length - 1].botDied) showCue('champion', { rounds: fought.length });
+    // THE CROWD STAYS until the emperor dismisses it with one more press of the release button, so the closing shot is
+    // there for as long as he needs it; a thumbs press still shows its banners. With the wave book, a round committed
+    // while the crowd waits is fought: the commit, or the release, stages it, then the release lets it out.
+    // `--take`: the recording ends with the show (already cut where the TNT fell) and nobody is waited on.
+    if (args.take) {
+      if (take.rolling) { await sleep(TAKE_AFTER_CHAMPION_MS); await takeCut(args, ended ? 'the show stopped' : 'the last round was cleared'); }
+      showCue('dismissed');
+      break;
     }
-    if (args.escalate || args.showRounds) {
+    if (args.crowdBody && args.emperorConsole) {
+      log('emperor', 'the show is over; the crowd stays until the emperor presses release to dismiss it' +
+        (args.waveBook && !ended ? ' (or commits another round on the board)' : ''));
+      let more = false;
+      for (;;) {
+        await sleep(1500);   // the last press must have sprung back before the next one counts
+        const said = await args.emperorConsole.awaitRelease('dismiss');
+        const book = args.waveBook && !ended ? crowdShow.checkBook(crowdShow.readBook(), args.arenaSet.penPerGate) : null;
+        if (book && book.ok && book.book.rounds.length >= n) { args.rounds = book.book.rounds.length; more = true; break; }
+        if (said === 'restage') continue;
+        if (!said) log('emperor', 'the emperor never dismissed the crowd; it leaves now');
+        break;
+      }
+      if (more) { log('emperor', `the book holds round ${n} now; staging it`); continue; }
+      showCue('dismissed');
+    }
+    break;
+    }
+    if (args.escalate || args.showRounds || args.waveBook) {
       const won = rounds.filter(r => r.run && waveVerdict(r) === 'cleared');
       const kills = rounds.filter(r => r.run).reduce((s, r) => s + Math.max(0, (r.mobsStart || 0) - (r.mobsEnd || 0)), 0);
       log('verdict', `escalation: ${won.length} round(s) cleared · ${kills} opponent(s) gone, killed or detonated · ` +
@@ -1741,6 +2028,8 @@ async function main() {
     console.error(`lanista failed: ${e.stack || e.message}`);
     return 1;
   } finally {
+    // A take still rolling when the show leaves by any other way is cut and wrapped before anything comes down.
+    if (take.rolling) await takeCut(args, 'the show ended early');
     if (args.whenBoard) args.whenBoard.close();
     if (args.obsWatch) clearInterval(args.obsWatch);
     if (args.strikerBody) args.strikerBody.end();

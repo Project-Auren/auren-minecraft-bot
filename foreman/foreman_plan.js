@@ -19,7 +19,7 @@ const PERMITTED = {
   difficulty: DIFFICULTIES,
   clock: ['dawn', 'day', 'held'],
   record: ['off', 'cameras', 'film'],
-  go: ['now', 'held'],
+  go: ['now', 'held', 'operator'],
   landing: ['usual', 'random'],
   windowsPriority: ['normal', 'high'],
   memoryWorkspace: ['adaptive', 'off'],
@@ -103,8 +103,10 @@ function endsWhenHeld() {
   const m = /^held:([a-z0-9_]+):([0-9]+)$/.exec(String(CONFIG.ends || ''));
   return m && Number(m[2]) > 0 ? { item: m[1], count: Number(m[2]) } : null;
 }
-// A held crew is raised and placed, and waits for the operator's `start` before any body works.
-function heldForGo() { return CONFIG.go === 'held'; }
+// A held crew is raised and placed, and waits before any body works: 'held' until the foreman releases it once every body
+// stands, 'operator' until the operator's own verb (a bench arming its body, as lanista's gladiator is armed by `sentry`).
+function heldForGo() { return CONFIG.go === 'held' || CONFIG.go === 'operator'; }
+function foremanReleases() { return CONFIG.go === 'held'; }
 
 // Does the foreman roll where a crew it raises lands? The one place that knows what 'random' means for the run (Law 16).
 function landsAtRandom() { return CONFIG.landing === 'random'; }
@@ -128,7 +130,7 @@ function overlays() {
   const eye = CONFIG.observer ? `watched by ${CONFIG.observer}` : null;
   if (isTest()) return [`clock ${CONFIG.clock}`, seatOnly() ? 'a seat to fly, no bot cameras' : 'no cameras', 'not watched', testModes.describe(CONFIG.test), eye].filter(Boolean).join(' · ');
   return [`clock ${CONFIG.clock}`, CONFIG.record === 'off' ? 'no cameras' : CONFIG.record,
-    CONFIG.watch ? `watched (wakes on ${CONFIG.wake.join(', ')})` : 'not watched', heldForGo() ? 'crew held for start' : null, eye].filter(Boolean).join(' · ');
+    CONFIG.watch ? `watched (wakes on ${CONFIG.wake.join(', ')})` : 'not watched', heldForGo() ? (foremanReleases() ? 'crew held for start' : 'crew held for the operator') : null, eye].filter(Boolean).join(' · ');
 }
 
 // ── A ROLLBACK START EMPTIES THE FLEET'S MEMORY ──────────────────────────────────────────────────────
@@ -183,4 +185,4 @@ const progress = { sentence: null, crew: 'waiting', soakEndsAt: null, closing: n
 function note(fields) { Object.assign(progress, fields); }
 function progressNow() { return { ...progress, sentence: sentence() }; }
 
-module.exports = { CONFIG, check, sentence, overlays, isTest, testName, seatOnly, record, continues, build, planned, endsWhenBuilt, endsWhenReal, endsWhenHeld, heldForGo, landsAtRandom, emptyMemory, freshWorld, restoreFreshWorld, note, progressNow };
+module.exports = { CONFIG, check, sentence, overlays, isTest, testName, seatOnly, record, continues, build, planned, endsWhenBuilt, endsWhenReal, endsWhenHeld, heldForGo, foremanReleases, landsAtRandom, emptyMemory, freshWorld, restoreFreshWorld, note, progressNow };

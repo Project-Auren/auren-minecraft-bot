@@ -208,7 +208,7 @@ function aggroVerdict(bot, entity, name, distance, self, now, reaction) {
   }
   // A terminator (designation T) takes the pack by sight (combat_utils TERMINATOR_TAKES).
   if (PROVOKED_ONLY_NAMES.has(name)
-    && !(combatBoard.isTerminator() && require('@utils/combat_utils').terminatorTakes(name))) {
+    && !(combatBoard.fightsAsTerminator() && require('@utils/combat_utils').terminatorTakes(name))) {
     // Fields match a cast's shape minus the cast: `seen: null` since nothing was measured (Law 25).
     return { aggroed: false, seen: null, inRange: withinReach, blockedBy: null, cast: false, via: null };
   }

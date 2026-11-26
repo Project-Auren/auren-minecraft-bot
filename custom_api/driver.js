@@ -1732,7 +1732,7 @@ function onPhysicsTick(bot) {
     if (press && travelled < STALL_EPS) stallTicks++; else { stallTicks = 0; stallJumps = 0; }
   }
   // THE CRIT is a terminator's, against the mob its feet are on when that mob takes the plain blow: a witch or an archer.
-  const critMob = require('@api/combat_board').isTerminator() && kiter
+  const critMob = require('@api/combat_board').fightsAsTerminator() && kiter
     && (order.mode === 'press' || order.mode === 'hold' || order.mode === 'approach' || order.mode === 'retreat');
   // A swum run holds jump, re-armed each tick it swims, and released by the countdown once it stops. A route's swim holds
   // it only toward a higher cell (the stroke up and the climb out); level or down, the head-up rule below keeps it up.

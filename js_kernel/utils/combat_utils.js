@@ -486,7 +486,7 @@ function fieldAheadOn(active) {
 // swingTarget) and the feet walk straight on and stay on her, circling her away from the nearest melee mob (driver THE
 // PRESS). A swelling creeper is met with the raised shield; only a body with no shield and no block backs off (Law 17).
 function witchOnly(focus) {
-  return !!focus && healsItself(focus.name) && require('@api/combat_board').isTerminator();
+  return !!focus && healsItself(focus.name) && require('@api/combat_board').fightsAsTerminator();
 }
 
 // ── WHAT THE BODY CARRIES ───────────────────────────────────────────────────────────────────────────────

@@ -15,7 +15,9 @@
              DIFFERENT world, run the 'flush' verb yourself before starting -- flush is deliberate,
              never a restore side effect.
   list     : List available snapshots for a world.
-  prune    : Keep only the newest N snapshots, deleting older ones.
+  prune    : Keep only the newest N snapshots, deleting older ones. A save point (a snapshot with the fleet's
+             memory beside it in memory_snapshots, taken by fleet_control snapshot --memory) and the world's
+             clean copy (<world>_fresh_start) are never pruned.
 
 .PARAMETERS
   -World         Name of the world folder. Default: whatever server.properties says is live —
@@ -289,7 +291,13 @@ switch($Action){
     if($Keep -le 0){ Write-Err '-Keep must be > 0 for prune'; exit 1 }
     $snapshots = Get-Snapshots
     if($snapshots.Count -le $Keep){ Write-Info "Nothing to prune (have $($snapshots.Count), keeping $Keep)"; break }
-    $toDelete = $snapshots | Select-Object -Skip $Keep
+    # Two kinds are kept whatever their age: a save point (its memory copy beside it marks it as one a person named and
+    # keeps) and the world's clean copy, <world>_fresh_start, which every rollback start puts back (foreman_plan).
+    $memRoot = Join-Path (Join-Path $scriptRoot 'memory_snapshots') ($World -replace '[\\/:*?"<>|]','_')
+    # The kept ones are set aside first, so -Keep counts only snapshots that could be pruned.
+    $toDelete = $snapshots | Where-Object {
+      -not (Test-Path -LiteralPath (Join-Path $memRoot $_.Name)) -and $_.Name -ne "$($World)_fresh_start" } | Select-Object -Skip $Keep
+    if(-not $toDelete){ Write-Info 'Nothing to prune: every older snapshot is a save point or the clean copy, kept.'; break }
     if(-not $Force){
       Write-Host "Pruning will delete: " -NoNewline
       Write-Host ($toDelete.Name -join ', ')
@@ -299,8 +307,9 @@ switch($Action){
     foreach($d in $toDelete){
       Write-Info "Deleting snapshot folder $($d.Name)"
       Remove-Item -Recurse -Force $d.FullName
-      $zip = Join-Path $worldSnapRoot ($d.Name + '.zip')
-      if(Test-Path $zip){ Remove-Item -Force $zip }
+      # Not $zip: PowerShell names ignore case, and $Zip is this script's switch parameter.
+      $prunedZip = Join-Path $worldSnapRoot ($d.Name + '.zip')
+      if(Test-Path $prunedZip){ Remove-Item -Force $prunedZip }
     }
     Write-Info 'Prune complete.'
     break

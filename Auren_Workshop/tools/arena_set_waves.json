@@ -1,0 +1,69 @@
+{
+ "rounds": [
+  {
+   "groups": [
+    {
+     "mob": "creeper",
+     "count": 4,
+     "gate": "spread"
+    }
+   ],
+   "every": 8
+  },
+  {
+   "groups": [
+    {
+     "mob": "creeper",
+     "count": 4,
+     "gate": "spread"
+    },
+    {
+     "mob": "zombie",
+     "count": 4,
+     "gate": "spread"
+    }
+   ],
+   "every": 10
+  },
+  {
+   "groups": [
+    {
+     "mob": "creeper",
+     "count": 4,
+     "gate": "spread"
+    },
+    {
+     "mob": "zombie",
+     "count": 4,
+     "gate": "spread"
+    },
+    {
+     "mob": "skeleton",
+     "count": 4,
+     "gate": "spread"
+    }
+   ],
+   "every": 10
+  },
+  {
+   "groups": [
+    {
+     "mob": "creeper",
+     "count": 4,
+     "gate": "spread"
+    },
+    {
+     "mob": "zombie_horseman",
+     "count": 4,
+     "gate": "spread"
+    },
+    {
+     "mob": "witch",
+     "count": 1,
+     "gate": "north"
+    }
+   ],
+   "every": 10
+  }
+ ]
+}

@@ -686,6 +686,31 @@ for ($i = 0; $i -lt $toLaunch.Count; $i++) {
     if ($i -lt ($toLaunch.Count - 1)) { Start-Sleep -Seconds 5 }
 }
 
+# A NEW INSTANCE'S FIRST LAUNCH CAN BE DROPPED. Prism resolves a never-launched instance's components
+# from its cached version metadata; when that cache fails its checksum (Prism's log:
+# "Checksum mismatch ... meta/net.minecraft/<version>.json"), the resolve fails, the command-line launch is
+# dropped, and Prism re-downloads the metadata seconds later but launches nothing until someone clicks
+# Launch. So every window that has no game process 60 s after its launch is asked once more; by then
+# the metadata is fresh. Sensed from the processes, the same way -Add senses who is standing.
+function Get-StandingCams($cams) {
+    $up = @()
+    foreach ($proc in @(Get-CimInstance Win32_Process -Filter "Name LIKE 'java%'" -ErrorAction SilentlyContinue)) {
+        foreach ($cam in $cams) {
+            if ($proc.CommandLine -match "instances[\\/]$([regex]::Escape($cam))[\\/]") { $up += $cam }
+        }
+    }
+    return @($up | Sort-Object -Unique)
+}
+if ($toLaunch.Count) {
+    $deadline = (Get-Date).AddSeconds(60)
+    do { Start-Sleep -Seconds 5; $standing = Get-StandingCams $toLaunch } while ($standing.Count -lt $toLaunch.Count -and (Get-Date) -lt $deadline)
+    foreach ($cam in @($toLaunch | Where-Object { $standing -notcontains $_ })) {
+        Write-Host "No game process for '$cam' 60 s after its launch (a first launch Prism dropped) - launching it once more."
+        Start-Process $prismExe -ArgumentList '--launch', $cam, '--offline', (Get-PlayerName $cam), '--server', "127.0.0.1:$gamePort" `
+            -RedirectStandardOutput (Join-Path $launchLogDir "$cam.retry.out.log") -RedirectStandardError (Join-Path $launchLogDir "$cam.retry.err.log")
+    }
+}
+
 # The director — reuses $node (located up-front for the roster read; guaranteed set by the early exit).
 # --bots carries ONLY the roster cameras; the free camera travels on --freecams, which is armed and
 # never commanded. Two lists, so the exclusion cannot be undone by an edit inside the rig.
